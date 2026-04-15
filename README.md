@@ -1,36 +1,108 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Chess2pdf
+
+**Free, browser-only chess PDF reader.** Open a chessbook PDF, detect diagrams automatically, correct positions when needed, play out the suggested lines, and get immediate Stockfish evaluation when you deviate — all without uploading anything to a server.
+
+## Features
+
+- **Open any chess PDF** — drag-and-drop or file picker; PDF bytes never leave the browser
+- **Local diagram detection** — grid-analysis detects board-like regions with confidence scoring
+- **Local OCR** — Tesseract WASM extracts SAN move notation from the page
+- **Interactive study board** — react-chessboard with flip, undo, reset, and edit mode
+- **Play suggested lines** — step through recognised book moves; deviation is caught immediately
+- **Local Stockfish analysis** — Stockfish 18 lite WASM runs in a Web Worker; no server call
+- **Edit mode** — place/remove individual pieces to correct any recognised position
+- **FEN / PGN clipboard** — copy the current FEN or the parsed PGN; open Lichess in one click
+- **IndexedDB sessions** — recognised FENs and move lines are stored locally; original PDFs are not saved
+- **No account, no upload route, no telemetry**
+
+## Tech Stack
+
+| Layer | Library |
+|---|---|
+| Framework | Next.js 16 (App Router, TypeScript) |
+| PDF rendering | pdfjs-dist 5 (self-hosted worker) |
+| OCR | tesseract.js 7 (WASM, self-hosted assets) |
+| Move validation | chess.js 1 |
+| Board UI | react-chessboard 5 |
+| Engine | Stockfish 18 lite single-threaded WASM |
+| Persistence | idb / IndexedDB |
+| Styling | Tailwind CSS 4 |
+| Tests | Vitest + Playwright |
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Available Scripts
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Command | Purpose |
+|---|---|
+| `npm run dev` | Start dev server |
+| `npm run build` | Production build |
+| `npm run lint` | ESLint |
+| `npm run test` | Unit tests (Vitest) |
+| `npm run test:e2e` | End-to-end tests (Playwright) |
 
-## Learn More
+## Project Structure
 
-To learn more about Next.js, take a look at the following resources:
+```
+src/
+  app/             Next.js App Router entry
+  components/      chess2pdf-app.tsx  — main UI component
+  lib/
+    pdf-processing.ts   PDF.js load, render, grid detection, OCR
+    move-parser.ts      SAN extraction and validation via chess.js
+    stockfish.ts        Stockfish WASM worker wrapper
+    fen-editor.ts       FEN manipulation helpers
+    file-validation.ts  PDF signature & size check
+    storage.ts          IndexedDB session persistence
+    constants.ts        App-wide constants
+    types.ts            Shared TypeScript types
+public/
+  pdfjs/           pdf.worker.min.mjs
+  stockfish/       Stockfish 18 lite WASM + JS wrapper
+  tesseract/       Tesseract WASM core assets (self-hosted)
+  tessdata/        eng.traineddata.gz (English OCR model)
+tests/
+  e2e/             Playwright tests
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Security
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- PDF bytes are validated against the `%PDF` magic bytes signature before being parsed.
+- Maximum file size: 50 MB. Maximum pages: 250.
+- OCR output is never injected as HTML.
+- All workers and assets are self-hosted; no CDN dependency at runtime.
+- Strict Content Security Policy: `default-src 'self'`, `object-src 'none'`, `frame-ancestors 'none'`.
+- No upload API route exists. There is no server-side PDF processing.
 
-## Deploy on Vercel
+## Known Limitations
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- **Board recognition is best-effort** — v1 uses grid analysis and ink density. It works well for clean digital PDFs; scanned photos and unusual piece fonts need FEN correction.
+- **OCR of chess notation** — characters such as `O-O`, `0-0`, `N`, `K`, `x`, `+`, `#` are commonly confused. Always verify parsed moves before serious study.
+- **Browser-only processing** — heavy PDFs (200+ pages, large scans) may be slow on older devices.
+- **Copyright** — the app processes PDFs you own locally. It does not provide a public PDF library.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Deploy to Vercel
+
+Push this repo to GitHub, then import it in [Vercel](https://vercel.com/new). No environment variables are required.
+
+```bash
+git remote add origin git@github.com:YOUR_USERNAME/chess2pdf.git
+git push -u origin main
+```
+
+Then connect the repo in Vercel and deploy with default Next.js settings.
+
+## Roadmap
+
+- [ ] Stronger piece classification (ML model trained on chess diagram fonts)
+- [ ] Multi-diagram exercise list per page
+- [ ] PGN import for exercises without a PDF
+- [ ] Mobile-optimised layout
+- [ ] PWA / offline support

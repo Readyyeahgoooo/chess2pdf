@@ -73,6 +73,7 @@ export function Chess2PdfApp() {
   const [ocrTextDraft, setOcrTextDraft] = useState("");
   const [aiStatus, setAiStatus] = useState("AI coach idle");
   const [aiResult, setAiResult] = useState<ChessAiResponse | null>(null);
+  const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
   const [cropMode, setCropMode] = useState(false);
   const [cropStart, setCropStart] = useState<CropPoint | null>(null);
   const [cropBox, setCropBox] = useState<BBox | null>(null);
@@ -125,6 +126,15 @@ export function Chess2PdfApp() {
     queueMicrotask(() => {
       void refreshSessions();
     });
+    // Probe whether AI coach is configured (OPENROUTER_API_KEY set on server)
+    void fetch("/api/ai/chess", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "line-summary", startingFen: "", currentFen: "", recognizedMoves: [], playedMoves: [], rawText: "" }),
+    })
+      .then((r) => r.json())
+      .then((data: { configured?: boolean }) => setAiConfigured(data.configured !== false))
+      .catch(() => setAiConfigured(false));
 
     return () => {
       stockfishRef.current?.dispose();
@@ -276,16 +286,17 @@ export function Chess2PdfApp() {
     if (!pagePreviewsRef.current.has(boundedPageIndex) || !canvasesRef.current.has(boundedPageIndex)) {
       setProgress(`Rendering page ${boundedPageIndex + 1}...`);
       await renderAndCachePage(document, boundedPageIndex);
+      setProgress(`Page ${boundedPageIndex + 1} ready.`);
     }
-    if (!scannedPagesRef.current.has(boundedPageIndex)) {
-      setProgress(`Scanning page ${boundedPageIndex + 1} for diagrams...`);
-      await scanPages([boundedPageIndex]);
-    } else {
+    // If already scanned, auto-select best diagram on this page
+    if (scannedPagesRef.current.has(boundedPageIndex)) {
       const pageFirstDiagram = bestDiagramForPage(boundedPageIndex, diagrams);
       if (pageFirstDiagram) {
         await selectDiagram(pageFirstDiagram, lines, { auto: true, navigate: false });
       }
     }
+    // Don't auto-scan — user clicks "Scan page" / "Scan range" explicitly.
+    // Auto-scanning every unvisited page was causing ~8s OCR freezes per click.
   }
 
   async function renderAndCachePage(document: PdfDocument, pageIndex: number) {
@@ -769,6 +780,16 @@ export function Chess2PdfApp() {
         </header>
 
         {error ? <div className="rounded-md border border-bad bg-white px-4 py-3 text-sm text-bad">{error}</div> : null}
+
+        {status === "loading" || status === "scanning" ? (
+          <div className="flex items-center gap-3 rounded-md border border-accent bg-[#e8f5f1] px-4 py-3 text-sm">
+            <svg className="h-4 w-4 animate-spin text-accent" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span className="font-medium text-accent">{progress}</span>
+          </div>
+        ) : null}
 
         <section className="grid flex-1 gap-4 xl:grid-cols-[360px_minmax(430px,1fr)_420px]">
           <aside className="min-h-[520px] rounded-md border border-line bg-panel">
@@ -1270,9 +1291,13 @@ export function Chess2PdfApp() {
                     <p className={`font-semibold ${aiResult.ok ? "text-foreground" : "text-warn"}`}>{aiResult.title}</p>
                     <p className="mt-2 whitespace-pre-wrap leading-6 text-muted">{aiResult.explanation}</p>
                   </>
+                ) : aiConfigured === false ? (
+                  <p className="text-muted">
+                    AI coach is not configured on this deployment.
+                  </p>
                 ) : (
                   <p className="text-muted">
-                    Optional. Add <span className="font-semibold">OPENROUTER_API_KEY</span> on Vercel to enable short chess explanations.
+                    Click a button above after scanning a board to get AI explanations.
                   </p>
                 )}
               </div>

@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
-import { DEFAULT_DEPTH, OCR_CONCURRENCY, SAMPLE_FENS, STARTING_FEN } from "@/lib/constants";
+import { DEFAULT_DEPTH, MAX_CACHED_CANVASES, OCR_CONCURRENCY, SAMPLE_FENS, STARTING_FEN } from "@/lib/constants";
 import { clearFen, isSquare, isValidFen, movePieceInFen, placePieceInFen, safeFen } from "@/lib/fen-editor";
 import { validatePdfFile } from "@/lib/file-validation";
 import { lineToPgn, parseRecognizedLine } from "@/lib/move-parser";
@@ -11,6 +11,7 @@ import {
   loadPdfDocument,
   renderPdfPage,
   scanRenderedPage,
+  type PdfDocument,
   type RenderedPage,
 } from "@/lib/pdf-processing";
 import { clearLocalData, listSessions, saveSession } from "@/lib/storage";
@@ -43,7 +44,10 @@ export function Chess2PdfApp() {
   const [hasPdfLoaded, setHasPdfLoaded] = useState(false);
   const [fileMeta, setFileMeta] = useState<{ name: string; size: number } | null>(null);
   const [pages, setPages] = useState<PdfPagePreview[]>([]);
+  const [totalPages, setTotalPages] = useState(0);
   const [currentPage, setCurrentPage] = useState(0);
+  const [scanRangeStart, setScanRangeStart] = useState(1);
+  const [scanRangeEnd, setScanRangeEnd] = useState(1);
   const [diagrams, setDiagrams] = useState<DetectedDiagram[]>([]);
   const [lines, setLines] = useState<RecognizedLine[]>([]);
   const [selectedDiagramId, setSelectedDiagramId] = useState<string | null>(null);
@@ -62,13 +66,15 @@ export function Chess2PdfApp() {
   const [aiResult, setAiResult] = useState<ChessAiResponse | null>(null);
 
   const canvasesRef = useRef(new Map<number, HTMLCanvasElement>());
-  const pdfRef = useRef<Awaited<ReturnType<typeof loadPdfDocument>> | null>(null);
+  const pagePreviewsRef = useRef(new Map<number, PdfPagePreview>());
+  const pdfRef = useRef<PdfDocument | null>(null);
   const stockfishRef = useRef<StockfishClient | null>(null);
   const scanRunRef = useRef(0);
 
   const selectedDiagram = diagrams.find((diagram) => diagram.id === selectedDiagramId) ?? diagrams[0];
   const selectedLines = selectedDiagram ? lines.filter((line) => line.diagramId === selectedDiagram.id) : lines;
   const expectedLine = selectedLines.find((line) => line.sanMoves.length > 0) ?? selectedLines[0];
+  const pagePreviewMap = useMemo(() => new Map(pages.map((page) => [page.pageIndex, page])), [pages]);
   const currentChess = useMemo(() => {
     try {
       return new Chess(fen);
@@ -118,27 +124,23 @@ export function Chess2PdfApp() {
     try {
       pdfRef.current?.destroy();
       canvasesRef.current.clear();
+      pagePreviewsRef.current.clear();
       const document = await loadPdfDocument(file);
       pdfRef.current = document;
       setHasPdfLoaded(true);
       setFileMeta({ name: file.name, size: file.size });
       setPages([]);
+      setTotalPages(document.numPages);
+      setScanRangeStart(1);
+      setScanRangeEnd(Math.min(document.numPages, 20));
       setDiagrams([]);
       setLines([]);
       setSelectedDiagramId(null);
-      setProgress(`Rendering ${document.numPages} local page preview${document.numPages === 1 ? "" : "s"}...`);
-
-      const renderedPages: PdfPagePreview[] = [];
-      for (let index = 0; index < document.numPages; index += 1) {
-        const rendered = await renderPdfPage(document, index);
-        canvasesRef.current.set(index, rendered.canvas);
-        renderedPages.push(stripCanvas(rendered));
-        setPages([...renderedPages]);
-      }
-
       setCurrentPage(0);
+      setProgress(`Opened ${document.numPages} page${document.numPages === 1 ? "" : "s"}. Rendering page 1...`);
+      await renderAndCachePage(document, 0);
       setStatus("ready");
-      setProgress("Rendered locally. Start scanning when ready.");
+      setProgress("Page 1 ready. Scan the current page or choose a range.");
       await scanPages([0]);
     } catch (scanError) {
       setStatus("error");
@@ -170,10 +172,9 @@ export function Chess2PdfApp() {
         if (pageIndex === undefined) {
           return;
         }
-        const canvas = canvasesRef.current.get(pageIndex) ?? (await renderAndCachePage(loadedDocument, pageIndex)).canvas;
-        const page = pages.find((item) => item.pageIndex === pageIndex) ?? stripCanvas(await renderAndCachePage(loadedDocument, pageIndex));
+        const rendered = await getRenderedPage(loadedDocument, pageIndex);
         setProgress(`Scanning page ${pageIndex + 1} with local OCR and grid detection...`);
-        const result = await scanRenderedPage({ ...page, canvas });
+        const result = await scanRenderedPage(rendered);
         newDiagrams.push(...result.diagrams);
         newLines.push(...result.lines);
         setDiagrams((current) => mergeById(current, result.diagrams, (item) => item.id));
@@ -207,11 +208,55 @@ export function Chess2PdfApp() {
     }
   }
 
-  async function renderAndCachePage(document: Awaited<ReturnType<typeof loadPdfDocument>>, pageIndex: number) {
+  async function getRenderedPage(document: PdfDocument, pageIndex: number) {
+    const canvas = canvasesRef.current.get(pageIndex);
+    const preview = pagePreviewsRef.current.get(pageIndex);
+    if (canvas && preview) {
+      return { ...preview, canvas };
+    }
+    return renderAndCachePage(document, pageIndex);
+  }
+
+  async function navigateToPage(pageIndex: number) {
+    const document = pdfRef.current;
+    const boundedPageIndex = Math.max(0, Math.min(totalPages - 1, pageIndex));
+    setCurrentPage(boundedPageIndex);
+    if (!document) {
+      return;
+    }
+    if (!pagePreviewsRef.current.has(boundedPageIndex) || !canvasesRef.current.has(boundedPageIndex)) {
+      setProgress(`Rendering page ${boundedPageIndex + 1}...`);
+      await renderAndCachePage(document, boundedPageIndex);
+      setProgress(`Page ${boundedPageIndex + 1} ready.`);
+    }
+  }
+
+  async function renderAndCachePage(document: PdfDocument, pageIndex: number) {
     const rendered = await renderPdfPage(document, pageIndex);
     canvasesRef.current.set(pageIndex, rendered.canvas);
-    setPages((current) => mergeById(current, [stripCanvas(rendered)], (item) => String(item.pageIndex)));
+    pagePreviewsRef.current.set(pageIndex, stripCanvas(rendered));
+    evictCachedPages(pageIndex);
+    setPages(Array.from(pagePreviewsRef.current.values()).sort((a, b) => a.pageIndex - b.pageIndex));
     return rendered;
+  }
+
+  function evictCachedPages(anchorPageIndex: number) {
+    if (canvasesRef.current.size <= MAX_CACHED_CANVASES) {
+      return;
+    }
+
+    const keep = new Set(
+      Array.from(canvasesRef.current.keys())
+        .sort((a, b) => Math.abs(a - anchorPageIndex) - Math.abs(b - anchorPageIndex))
+        .slice(0, MAX_CACHED_CANVASES),
+    );
+
+    for (const pageIndex of Array.from(canvasesRef.current.keys())) {
+      if (!keep.has(pageIndex)) {
+        canvasesRef.current.delete(pageIndex);
+        pagePreviewsRef.current.delete(pageIndex);
+      }
+    }
   }
 
   function buildSession(sessionDiagrams: DetectedDiagram[], sessionLines: RecognizedLine[]): PdfSession | null {
@@ -236,7 +281,7 @@ export function Chess2PdfApp() {
 
   function selectDiagram(diagram: DetectedDiagram) {
     setSelectedDiagramId(diagram.id);
-    setCurrentPage(diagram.pageIndex);
+    void navigateToPage(diagram.pageIndex);
     resetBoard(diagram.fen);
     const line = lines.find((item) => item.diagramId === diagram.id);
     setOcrTextDraft(line?.rawText || "");
@@ -428,6 +473,16 @@ export function Chess2PdfApp() {
     setProgress("History cleared.");
   }
 
+  function scanSelectedRange() {
+    if (!totalPages) {
+      return;
+    }
+    const start = Math.max(1, Math.min(totalPages, scanRangeStart));
+    const end = Math.max(start, Math.min(totalPages, scanRangeEnd));
+    const indices = Array.from({ length: end - start + 1 }, (_, offset) => start - 1 + offset);
+    void scanPages(indices);
+  }
+
   const currentPreview = pages.find((page) => page.pageIndex === currentPage);
   const visiblePageDiagrams = diagrams.filter((diagram) => diagram.pageIndex === currentPage);
   const evalText = formatEval(engineEval);
@@ -467,7 +522,9 @@ export function Chess2PdfApp() {
           <aside className="min-h-[520px] rounded-md border border-line bg-panel">
             <div className="border-b border-line p-4">
               <h2 className="text-lg font-semibold">PDF pages</h2>
-              {fileMeta ? <p className="text-sm text-muted">{`${fileMeta.name} (${formatBytes(fileMeta.size)})`}</p> : null}
+              {fileMeta ? (
+                <p className="text-sm text-muted">{`${fileMeta.name} (${formatBytes(fileMeta.size)}), ${totalPages} page${totalPages === 1 ? "" : "s"}`}</p>
+              ) : null}
             </div>
             <div
               className="m-4 rounded-md border border-dashed border-line p-4 text-sm text-muted"
@@ -482,7 +539,7 @@ export function Chess2PdfApp() {
             >
               Drop a PDF here. The app checks the PDF signature and size before rendering it locally.
             </div>
-            <div className="flex gap-2 px-4 pb-3">
+            <div className="flex flex-wrap gap-2 px-4 pb-3">
               <button
                 className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={!hasPdfLoaded || status === "scanning"}
@@ -491,34 +548,70 @@ export function Chess2PdfApp() {
                 Scan page
               </button>
               <button
-                className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!hasPdfLoaded || pages.length === 0 || status === "scanning"}
-                onClick={() => void scanPages(pages.map((page) => page.pageIndex))}
+                className="rounded-md border border-line px-3 py-2 text-sm font-semibold"
+                disabled={status !== "scanning"}
+                onClick={cancelScan}
               >
-                Scan all
-              </button>
-              <button className="rounded-md border border-line px-3 py-2 text-sm font-semibold" onClick={cancelScan}>
                 Cancel
               </button>
             </div>
-            <div className="max-h-[58vh] space-y-3 overflow-auto px-4 pb-4">
-              {pages.length === 0 ? (
+            <div className="grid grid-cols-[1fr_1fr_auto] gap-2 px-4 pb-3">
+              <label className="text-xs font-semibold text-muted">
+                From
+                <input
+                  className="mt-1 w-full rounded-md border border-line bg-white px-2 py-2 text-sm text-foreground"
+                  min={1}
+                  max={Math.max(1, totalPages)}
+                  type="number"
+                  value={scanRangeStart}
+                  onChange={(event) => setScanRangeStart(Number(event.target.value))}
+                />
+              </label>
+              <label className="text-xs font-semibold text-muted">
+                To
+                <input
+                  className="mt-1 w-full rounded-md border border-line bg-white px-2 py-2 text-sm text-foreground"
+                  min={1}
+                  max={Math.max(1, totalPages)}
+                  type="number"
+                  value={scanRangeEnd}
+                  onChange={(event) => setScanRangeEnd(Number(event.target.value))}
+                />
+              </label>
+              <button
+                className="self-end rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!hasPdfLoaded || status === "scanning"}
+                onClick={scanSelectedRange}
+              >
+                Scan range
+              </button>
+              <p className="col-span-3 text-xs text-muted">Estimate: about 8 seconds per page on typical scans.</p>
+            </div>
+            <div className="max-h-[58vh] overflow-auto px-4 pb-4">
+              {totalPages === 0 ? (
                 <div className="rounded-md bg-background p-4 text-sm text-muted">
-                  Upload a PDF to see rendered page thumbnails here.
+                  Upload a PDF to see pages here.
                 </div>
               ) : (
-                pages.map((page) => (
-                  <button
-                    key={page.pageIndex}
-                    className={`block w-full rounded-md border p-2 text-left ${
-                      page.pageIndex === currentPage ? "border-accent bg-[#e8f5f1]" : "border-line bg-white"
-                    }`}
-                    onClick={() => setCurrentPage(page.pageIndex)}
-                  >
-                    <img className="mb-2 w-full rounded" src={page.thumbnailUrl} alt={`PDF page ${page.pageIndex + 1}`} />
-                    <span className="text-sm font-semibold">Page {page.pageIndex + 1}</span>
-                  </button>
-                ))
+                <div className="grid grid-cols-4 gap-2">
+                  {Array.from({ length: totalPages }, (_, index) => {
+                    const preview = pagePreviewMap.get(index);
+                    return (
+                      <button
+                        key={index}
+                        className={`min-h-14 rounded-md border p-1 text-center text-xs font-semibold ${
+                          index === currentPage ? "border-accent bg-[#e8f5f1]" : preview ? "border-line bg-white" : "border-line bg-[#f3f6f4]"
+                        }`}
+                        onClick={() => void navigateToPage(index)}
+                      >
+                        {preview ? (
+                          <img className="mx-auto mb-1 max-h-12 rounded object-contain" src={preview.thumbnailUrl} alt={`PDF page ${index + 1}`} />
+                        ) : null}
+                        {index + 1}
+                      </button>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </aside>

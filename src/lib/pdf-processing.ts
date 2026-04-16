@@ -3,7 +3,7 @@ import { parseRecognizedLine } from "@/lib/move-parser";
 import type { BBox, DetectedDiagram, PdfPagePreview, RecognizedLine } from "@/lib/types";
 
 type PdfJs = typeof import("pdfjs-dist");
-type PdfDocument = Awaited<ReturnType<PdfJs["getDocument"]>["promise"]>;
+export type PdfDocument = Awaited<ReturnType<PdfJs["getDocument"]>["promise"]>;
 
 export type RenderedPage = PdfPagePreview & {
   canvas: HTMLCanvasElement;

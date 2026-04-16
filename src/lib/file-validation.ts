@@ -10,7 +10,7 @@ export async function validatePdfFile(file: File): Promise<FileValidationResult>
   }
 
   if (file.size > MAX_PDF_BYTES) {
-    return { ok: false, reason: "PDFs are limited to 50 MB in the free browser workflow." };
+    return { ok: false, reason: "PDFs are limited to 100 MB in the free browser workflow." };
   }
 
   const hasPdfName = file.name.toLowerCase().endsWith(".pdf");

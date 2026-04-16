@@ -24,6 +24,21 @@ type RateLimitBucket = {
 };
 
 const rateLimitBuckets = new Map<string, RateLimitBucket>();
+const MAX_RATE_LIMIT_BUCKETS = 2_000;
+
+function evictStaleRateLimitBuckets(now: number) {
+  if (rateLimitBuckets.size <= MAX_RATE_LIMIT_BUCKETS) {
+    return;
+  }
+  for (const [ip, bucket] of rateLimitBuckets) {
+    if (now - bucket.dayStart > RATE_LIMIT_DAY_MS) {
+      rateLimitBuckets.delete(ip);
+    }
+    if (rateLimitBuckets.size <= MAX_RATE_LIMIT_BUCKETS) {
+      break;
+    }
+  }
+}
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -63,6 +78,14 @@ export async function POST(request: Request) {
         explanation: limited,
       },
       { status: 429 },
+    );
+  }
+
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return NextResponse.json(
+      { ok: false, configured: true, title: "Bad request", explanation: "Expected application/json." },
+      { status: 415 },
     );
   }
 
@@ -153,6 +176,7 @@ function clientIp(request: Request) {
 
 function checkRateLimit(ip: string) {
   const now = Date.now();
+  evictStaleRateLimitBuckets(now);
   const bucket = rateLimitBuckets.get(ip) ?? {
     minuteStart: now,
     minuteCount: 0,

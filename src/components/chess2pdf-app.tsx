@@ -67,6 +67,7 @@ export function Chess2PdfApp() {
 
   const canvasesRef = useRef(new Map<number, HTMLCanvasElement>());
   const pagePreviewsRef = useRef(new Map<number, PdfPagePreview>());
+  const scannedPagesRef = useRef(new Set<number>());
   const pdfRef = useRef<PdfDocument | null>(null);
   const stockfishRef = useRef<StockfishClient | null>(null);
   const scanRunRef = useRef(0);
@@ -125,6 +126,7 @@ export function Chess2PdfApp() {
       pdfRef.current?.destroy();
       canvasesRef.current.clear();
       pagePreviewsRef.current.clear();
+      scannedPagesRef.current.clear();
       const document = await loadPdfDocument(file);
       pdfRef.current = document;
       setHasPdfLoaded(true);
@@ -190,6 +192,11 @@ export function Chess2PdfApp() {
       return;
     }
 
+    // mark each scanned page so navigateToPage won't re-scan them
+    for (const pageIndex of indices) {
+      scannedPagesRef.current.add(pageIndex);
+    }
+
     const first = newDiagrams[0];
     if (first) {
       setSelectedDiagramId(first.id);
@@ -227,7 +234,19 @@ export function Chess2PdfApp() {
     if (!pagePreviewsRef.current.has(boundedPageIndex) || !canvasesRef.current.has(boundedPageIndex)) {
       setProgress(`Rendering page ${boundedPageIndex + 1}...`);
       await renderAndCachePage(document, boundedPageIndex);
-      setProgress(`Page ${boundedPageIndex + 1} ready.`);
+    }
+    if (!scannedPagesRef.current.has(boundedPageIndex)) {
+      setProgress(`Scanning page ${boundedPageIndex + 1} for diagrams...`);
+      await scanPages([boundedPageIndex]);
+    } else {
+      // page already scanned — auto-select its first diagram if nothing is selected
+      const pageFirstDiagram = diagrams.find((d) => d.pageIndex === boundedPageIndex);
+      if (pageFirstDiagram) {
+        setSelectedDiagramId(pageFirstDiagram.id);
+        resetBoard(pageFirstDiagram.fen);
+        const diagramLine = lines.find((l) => l.diagramId === pageFirstDiagram.id);
+        setOcrTextDraft(diagramLine?.rawText ?? "");
+      }
     }
   }
 

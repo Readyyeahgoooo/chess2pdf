@@ -15,6 +15,7 @@ import {
 } from "@/lib/pdf-processing";
 import { clearLocalData, listSessions, saveSession } from "@/lib/storage";
 import { StockfishClient } from "@/lib/stockfish";
+import type { ChessAiMode, ChessAiResponse } from "@/lib/ai-chess";
 import type { DetectedDiagram, EngineEval, PdfPagePreview, PdfSession, PieceCode, RecognizedLine, ScanStatus } from "@/lib/types";
 
 const PIECES: PieceCode[] = ["wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP"];
@@ -78,6 +79,8 @@ export function Chess2PdfApp() {
   const [editMode, setEditMode] = useState(false);
   const [selectedPiece, setSelectedPiece] = useState<PieceCode | null>("wQ");
   const [ocrTextDraft, setOcrTextDraft] = useState(DEMO_LINE);
+  const [aiStatus, setAiStatus] = useState("AI coach idle");
+  const [aiResult, setAiResult] = useState<ChessAiResponse | null>(null);
 
   const canvasesRef = useRef(new Map<number, HTMLCanvasElement>());
   const pdfRef = useRef<Awaited<ReturnType<typeof loadPdfDocument>> | null>(null);
@@ -431,6 +434,39 @@ export function Chess2PdfApp() {
     }
   }
 
+  async function askAi(mode: ChessAiMode) {
+    setAiStatus(mode === "line-summary" ? "Summarizing book line..." : "Explaining deviation...");
+    setAiResult(null);
+
+    try {
+      const response = await fetch("/api/ai/chess", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          mode,
+          startingFen: safeFen(selectedDiagram?.fen ?? STARTING_FEN),
+          currentFen: fen,
+          recognizedMoves: expectedLine?.sanMoves ?? [],
+          playedMoves,
+          rawText: expectedLine?.rawText ?? ocrTextDraft,
+          deviationPly,
+          engineEval,
+        }),
+      });
+      const payload = (await response.json()) as ChessAiResponse;
+      setAiResult(payload);
+      setAiStatus(payload.ok ? "AI coach ready" : payload.title);
+    } catch (aiError) {
+      setAiResult({
+        ok: false,
+        configured: true,
+        title: "AI request failed",
+        explanation: aiError instanceof Error ? aiError.message : "Could not reach the AI route.",
+      });
+      setAiStatus("AI request failed");
+    }
+  }
+
   async function copyFen() {
     await navigator.clipboard.writeText(fen);
     setProgress("FEN copied.");
@@ -779,6 +815,39 @@ export function Chess2PdfApp() {
                 <p className="font-semibold">{evalText}</p>
                 <p className="mt-1 text-muted">Best move: {engineEval?.bestMove ?? "none yet"}</p>
                 <p className="mt-1 break-words text-muted">PV: {engineEval?.pv.join(" ") || "none yet"}</p>
+              </div>
+            </div>
+
+            <div className="rounded-md border border-line bg-panel p-4">
+              <h2 className="text-lg font-semibold">AI coach</h2>
+              <p className="text-sm text-muted">{aiStatus}</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!expectedLine?.sanMoves.length}
+                  onClick={() => void askAi("line-summary")}
+                >
+                  Summarize book line
+                </button>
+                <button
+                  className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!deviationPly}
+                  onClick={() => void askAi("deviation")}
+                >
+                  Explain deviation
+                </button>
+              </div>
+              <div className="mt-3 rounded-md bg-background p-3 text-sm">
+                {aiResult ? (
+                  <>
+                    <p className={`font-semibold ${aiResult.ok ? "text-foreground" : "text-warn"}`}>{aiResult.title}</p>
+                    <p className="mt-2 whitespace-pre-wrap leading-6 text-muted">{aiResult.explanation}</p>
+                  </>
+                ) : (
+                  <p className="text-muted">
+                    Optional. Add <span className="font-semibold">OPENROUTER_API_KEY</span> on Vercel to enable short chess explanations.
+                  </p>
+                )}
               </div>
             </div>
 

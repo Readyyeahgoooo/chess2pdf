@@ -14,6 +14,7 @@
 - **FEN / PGN clipboard** — copy the current FEN or the parsed PGN; open Lichess in one click
 - **IndexedDB sessions** — recognised FENs and move lines are stored locally; original PDFs are not saved
 - **No account, no upload route, no telemetry**
+- **Optional AI coach** — with `OPENROUTER_API_KEY`, summarize book lines and explain deviations using derived chess data only
 
 ## Tech Stack
 
@@ -28,6 +29,20 @@
 | Persistence | idb / IndexedDB |
 | Styling | Tailwind CSS 4 |
 | Tests | Vitest + Playwright |
+
+## Optional AI Coach
+
+The core app does not need an API key. PDF rendering, OCR, move parsing, and Stockfish analysis all still run locally.
+
+To enable AI explanations on Vercel, add:
+
+```bash
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=openrouter/auto
+NEXT_PUBLIC_SITE_URL=https://chess2pdf.vercel.app
+```
+
+The browser calls `/api/ai/chess`; the server route calls OpenRouter with FEN, recognized moves, played moves, and Stockfish output. It does not send original PDF bytes.
 
 ## Getting Started
 
@@ -90,7 +105,7 @@ tests/
 
 ## Deploy to Vercel
 
-Push this repo to GitHub, then import it in [Vercel](https://vercel.com/new). No environment variables are required.
+Push this repo to GitHub, then import it in [Vercel](https://vercel.com/new). No environment variables are required for the local-only workflow. Add `OPENROUTER_API_KEY` only if you want the optional AI coach.
 
 ```bash
 git remote add origin git@github.com:YOUR_USERNAME/chess2pdf.git

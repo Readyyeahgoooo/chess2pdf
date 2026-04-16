@@ -1,9 +1,27 @@
-import { MAX_PDF_PAGES, STARTING_FEN } from "@/lib/constants";
+import { MAX_PDF_PAGES } from "@/lib/constants";
 import { parseRecognizedLine } from "@/lib/move-parser";
 import type { BBox, DetectedDiagram, PdfPagePreview, RecognizedLine } from "@/lib/types";
 
 type PdfJs = typeof import("pdfjs-dist");
 export type PdfDocument = Awaited<ReturnType<PdfJs["getDocument"]>["promise"]>;
+
+const TEMPLATE_SIZE = 48;
+const TEMPLATE_PIECES = [
+  { fen: "K", glyph: "♔" },
+  { fen: "Q", glyph: "♕" },
+  { fen: "R", glyph: "♖" },
+  { fen: "B", glyph: "♗" },
+  { fen: "N", glyph: "♘" },
+  { fen: "P", glyph: "♙" },
+  { fen: "k", glyph: "♚" },
+  { fen: "q", glyph: "♛" },
+  { fen: "r", glyph: "♜" },
+  { fen: "b", glyph: "♝" },
+  { fen: "n", glyph: "♞" },
+  { fen: "p", glyph: "♟" },
+] as const;
+
+let pieceTemplates: Array<{ fen: string; ink: Float32Array; norm: number }> | undefined;
 
 export type RenderedPage = PdfPagePreview & {
   canvas: HTMLCanvasElement;
@@ -76,7 +94,7 @@ export function detectBoardCandidates(canvas: HTMLCanvasElement): Array<BBox & {
     for (let y = 0; y <= canvas.height - size; y += step) {
       for (let x = 0; x <= canvas.width - size; x += step) {
         const confidence = scoreBoardCandidate(context, x, y, size);
-        if (confidence > 0.36) {
+        if (confidence > 0.24) {
           candidates.push({ x, y, width: size, height: size, confidence });
         }
       }
@@ -105,12 +123,29 @@ export function classifyBoardFen(canvas: HTMLCanvasElement, bbox: BBox): { fen: 
     };
   }
 
-  // inferOccupancyFen only produces pawn-only positions which are misleading;
-  // fall through to lowConfidenceFen (STARTING_FEN) so the user has a
-  // recognisable starting point to correct from.
+  const templateResult = classifyBoardWithTemplates(context.canvas, bbox);
+  if (templateResult) {
+    return templateResult;
+  }
+
+  // Template matching failed (expected for scanned/printed books where piece pixels
+  // don’t match Unicode glyph shapes). Build a best-effort FEN from which squares
+  // are occupied so the board at least shows the correct pawn/piece structure.
+  const occupancyFen = buildOccupancyFen(occupancy);
+  if (occupancyFen) {
+    return {
+      fen: occupancyFen,
+      confidence: 0.32,
+      notes: [
+        "Piece types estimated from ink density — squares with pieces are shown but piece identity needs correction.",
+        "Use Edit mode or paste the FEN to fix piece identities.",
+      ],
+    };
+  }
+
   return lowConfidenceFen([
-    "A board-like grid was found, but piece types cannot be determined from pixel data alone.",
-    "Paste the correct FEN in \"Edit position / FEN\" below the board.",
+    "A board-like grid was detected but no pieces were distinguishable.",
+    "Use Crop board or Edit mode to set the correct position.",
   ]);
 }
 
@@ -157,6 +192,13 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
 
   for (const candidate of candidates.slice(0, 6)) {
     const classification = classifyBoardFen(page.canvas, candidate);
+    // Only skip if classification itself is at minimum confidence AND the visual
+    // candidate score was also very weak — avoids flooding with false positives
+    // from dense text columns while still passing real scanned diagrams through.
+    const likelyFalsePositive = classification.confidence <= 0.28 && candidate.confidence < 0.46;
+    if (likelyFalsePositive) {
+      continue;
+    }
     const diagram: DetectedDiagram = {
       id: crypto.randomUUID(),
       pageIndex: page.pageIndex,
@@ -243,12 +285,61 @@ export async function scanManualBoard(page: RenderedPage, bbox: BBox): Promise<B
 }
 
 function lowConfidenceFen(notes: string[]) {
-  // Fall back to STARTING_FEN: at least opening book lines will be legal from here.
   return {
-    fen: STARTING_FEN,
+    fen: "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
     confidence: 0.28,
     notes,
   };
+}
+
+/**
+ * Build a best-effort FEN by inferring which squares are occupied from ink
+ * density, assigning kings to the most-likely positions and generic pieces
+ * (pawn-like) to other occupied squares.
+ * Returns null if not enough material is found.
+ */
+function buildOccupancyFen(occupancy: number[]): string | null {
+  const threshold = 0.19;
+  const occupied = occupancy
+    .map((density, index) => ({ density, index }))
+    .filter((s) => s.density > threshold)
+    .sort((a, b) => b.density - a.density);
+
+  if (occupied.length < 3) {
+    return null;
+  }
+
+  const board: string[][] = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => ""));
+
+  // Try to identify kings by the darkest single squares in each half
+  const blackHalf = occupied.filter((s) => Math.floor(s.index / 8) <= 2);
+  const whiteHalf = occupied.filter((s) => Math.floor(s.index / 8) >= 5);
+  const blackKingSquare = blackHalf[0];
+  const whiteKingSquare = whiteHalf[0];
+
+  if (!blackKingSquare || !whiteKingSquare) {
+    return null;
+  }
+
+  const usedIndices = new Set<number>();
+  board[Math.floor(blackKingSquare.index / 8)][blackKingSquare.index % 8] = "k";
+  board[Math.floor(whiteKingSquare.index / 8)][whiteKingSquare.index % 8] = "K";
+  usedIndices.add(blackKingSquare.index);
+  usedIndices.add(whiteKingSquare.index);
+
+  // Fill remaining occupied squares with generic piece markers
+  for (const sq of occupied) {
+    if (usedIndices.has(sq.index)) continue;
+    const rank = Math.floor(sq.index / 8);
+    const file = sq.index % 8;
+    // Use uppercase for white half (ranks 5-7), lowercase for black half (ranks 0-2)
+    // For middle squares use pawn as best guess
+    board[rank][file] = rank <= 3 ? "p" : "P";
+    usedIndices.add(sq.index);
+  }
+
+  const rows = board.map(collapseFenRow);
+  return `${rows.join("/")} w - - 0 1`;
 }
 
 function makeThumbnail(source: HTMLCanvasElement, maxWidth: number): string {
@@ -268,6 +359,160 @@ function cropToDataUrl(source: HTMLCanvasElement, bbox: BBox): string {
   const context = canvas.getContext("2d");
   context?.drawImage(source, bbox.x, bbox.y, bbox.width, bbox.height, 0, 0, canvas.width, canvas.height);
   return canvas.toDataURL("image/jpeg", 0.82);
+}
+
+function classifyBoardWithTemplates(source: HTMLCanvasElement, bbox: BBox): { fen: string; confidence: number; notes: string[] } | null {
+  const templates = getPieceTemplates();
+  const board: string[][] = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => ""));
+  const scores: number[] = [];
+  let occupied = 0;
+  let whiteKings = 0;
+  let blackKings = 0;
+
+  for (let rank = 0; rank < 8; rank += 1) {
+    for (let file = 0; file < 8; file += 1) {
+      const ink = squareInkVector(source, bbox, rank, file);
+      const inkDensity = vectorAverage(ink);
+      if (inkDensity < 0.035) {
+        continue;
+      }
+
+      let best = { fen: "", score: 0 };
+      let second = 0;
+      for (const template of templates) {
+        const score = cosineSimilarity(ink, template.ink, template.norm);
+        if (score > best.score) {
+          second = best.score;
+          best = { fen: template.fen, score };
+        } else if (score > second) {
+          second = score;
+        }
+      }
+
+      const margin = best.score - second;
+      if (best.score < 0.34 || margin < 0.012) {
+        continue;
+      }
+
+      board[rank][file] = best.fen;
+      scores.push(Math.min(1, best.score * 0.82 + margin * 2));
+      occupied += 1;
+      if (best.fen === "K") {
+        whiteKings += 1;
+      }
+      if (best.fen === "k") {
+        blackKings += 1;
+      }
+    }
+  }
+
+  if (occupied < 2 || whiteKings !== 1 || blackKings !== 1) {
+    return null;
+  }
+
+  const confidence = Math.max(0.3, Math.min(0.82, vectorAverage(scores)));
+  return {
+    fen: `${board.map(collapseFenRow).join("/")} w - - 0 1`,
+    confidence,
+    notes: [
+      "Pieces were recognized with the local image classifier.",
+      "Scanned book diagrams can still need correction when the print is faint or skewed.",
+    ],
+  };
+}
+
+function getPieceTemplates() {
+  if (pieceTemplates) {
+    return pieceTemplates;
+  }
+
+  const canvas = window.document.createElement("canvas");
+  canvas.width = TEMPLATE_SIZE;
+  canvas.height = TEMPLATE_SIZE;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    pieceTemplates = [];
+    return pieceTemplates;
+  }
+
+  pieceTemplates = TEMPLATE_PIECES.map((piece) => {
+    context.clearRect(0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE);
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE);
+    context.fillStyle = "#000";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.font = `${Math.floor(TEMPLATE_SIZE * 0.86)}px "Apple Symbols", "DejaVu Sans", "Noto Sans Symbols 2", serif`;
+    context.fillText(piece.glyph, TEMPLATE_SIZE / 2, TEMPLATE_SIZE / 2 + TEMPLATE_SIZE * 0.02);
+    const data = context.getImageData(0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE).data;
+    const ink = new Float32Array(TEMPLATE_SIZE * TEMPLATE_SIZE);
+    for (let index = 0; index < ink.length; index += 1) {
+      const offset = index * 4;
+      const luminance = (data[offset] + data[offset + 1] + data[offset + 2]) / 3;
+      ink[index] = Math.max(0, (255 - luminance) / 255);
+    }
+    return { fen: piece.fen, ink, norm: vectorNorm(ink) };
+  });
+
+  return pieceTemplates;
+}
+
+function squareInkVector(source: HTMLCanvasElement, bbox: BBox, rank: number, file: number): Float32Array {
+  const cell = bbox.width / 8;
+  const margin = cell * 0.08;
+  const cropX = bbox.x + file * cell + margin;
+  const cropY = bbox.y + rank * cell + margin;
+  const cropSize = Math.max(2, cell - margin * 2);
+  const canvas = window.document.createElement("canvas");
+  canvas.width = TEMPLATE_SIZE;
+  canvas.height = TEMPLATE_SIZE;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    return new Float32Array(TEMPLATE_SIZE * TEMPLATE_SIZE);
+  }
+
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE);
+  context.imageSmoothingEnabled = true;
+  context.drawImage(source, cropX, cropY, cropSize, cropSize, 0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE);
+  const data = context.getImageData(0, 0, TEMPLATE_SIZE, TEMPLATE_SIZE).data;
+  const border: number[] = [];
+  for (let y = 0; y < TEMPLATE_SIZE; y += 1) {
+    for (let x = 0; x < TEMPLATE_SIZE; x += 1) {
+      if (x < 3 || y < 3 || x >= TEMPLATE_SIZE - 3 || y >= TEMPLATE_SIZE - 3) {
+        const offset = (y * TEMPLATE_SIZE + x) * 4;
+        border.push((data[offset] + data[offset + 1] + data[offset + 2]) / 3);
+      }
+    }
+  }
+  const background = percentile(border, 0.72);
+  const ink = new Float32Array(TEMPLATE_SIZE * TEMPLATE_SIZE);
+  for (let index = 0; index < ink.length; index += 1) {
+    const offset = index * 4;
+    const luminance = (data[offset] + data[offset + 1] + data[offset + 2]) / 3;
+    ink[index] = Math.max(0, Math.min(1, (background - luminance) / 150));
+  }
+  return ink;
+}
+
+function collapseFenRow(row: string[]): string {
+  let result = "";
+  let empty = 0;
+  for (const piece of row) {
+    if (!piece) {
+      empty += 1;
+      continue;
+    }
+    if (empty > 0) {
+      result += String(empty);
+      empty = 0;
+    }
+    result += piece;
+  }
+  if (empty > 0) {
+    result += String(empty);
+  }
+  return result;
 }
 
 function textRectangle(canvas: HTMLCanvasElement, bbox: BBox) {
@@ -334,7 +579,7 @@ function checkerboardAlternation(values: number[]): number {
     }
   }
 
-  return Math.min(1, Math.abs(Math.max(scoreA, scoreB)) / pairs + 0.35);
+  return Math.min(1, (Math.abs(Math.max(scoreA, scoreB)) / pairs) * 2);
 }
 
 function squareInkDensity(context: CanvasRenderingContext2D, bbox: BBox): number[] {
@@ -379,6 +624,46 @@ function average(values: number[]): number {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
+function vectorAverage(values: ArrayLike<number>): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  let sum = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    sum += values[index];
+  }
+  return sum / values.length;
+}
+
+function vectorNorm(values: ArrayLike<number>): number {
+  let sum = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    sum += values[index] * values[index];
+  }
+  return Math.sqrt(sum);
+}
+
+function cosineSimilarity(a: ArrayLike<number>, b: ArrayLike<number>, bNorm: number): number {
+  const aNorm = vectorNorm(a);
+  if (aNorm === 0 || bNorm === 0) {
+    return 0;
+  }
+  let dot = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    dot += a[index] * b[index];
+  }
+  return dot / (aNorm * bNorm);
+}
+
+function percentile(values: number[], ratio: number): number {
+  if (values.length === 0) {
+    return 255;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.max(0, Math.min(sorted.length - 1, Math.floor(sorted.length * ratio)));
+  return sorted[index];
+}
+
 function standardDeviation(values: number[]): number {
   const mean = average(values);
   const variance = average(values.map((value) => (value - mean) ** 2));
@@ -393,72 +678,6 @@ function nonOverlapping(candidates: Array<BBox & { confidence: number }>) {
     }
   }
   return kept;
-}
-
-function inferOccupancyFen(occupancy: number[]): string | null {
-  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => ""));
-  const occupied = occupancy
-    .map((density, index) => ({ density, index }))
-    .filter((sample) => sample.density > 0.21)
-    .sort((a, b) => b.density - a.density);
-
-  if (occupied.length < 6) {
-    return null;
-  }
-
-  board[0][4] = "k";
-  board[7][4] = "K";
-  let whitePawns = 0;
-  let blackPawns = 0;
-
-  for (const square of occupied) {
-    const rank = Math.floor(square.index / 8);
-    const file = square.index % 8;
-    if ((rank === 0 && file === 4) || (rank === 7 && file === 4)) {
-      continue;
-    }
-    if (rank === 0 || rank === 7) {
-      continue;
-    }
-
-    const isBlackHalf = rank <= 3;
-    if (isBlackHalf) {
-      if (blackPawns >= 8) {
-        continue;
-      }
-      board[rank][file] = "p";
-      blackPawns += 1;
-      continue;
-    }
-
-    if (whitePawns >= 8) {
-      continue;
-    }
-    board[rank][file] = "P";
-    whitePawns += 1;
-  }
-
-  const rows = board.map((row) => {
-    let result = "";
-    let empty = 0;
-    for (const cell of row) {
-      if (!cell) {
-        empty += 1;
-        continue;
-      }
-      if (empty > 0) {
-        result += String(empty);
-        empty = 0;
-      }
-      result += cell;
-    }
-    if (empty > 0) {
-      result += String(empty);
-    }
-    return result;
-  });
-
-  return `${rows.join("/")} w - - 0 1`;
 }
 
 function intersectionOverUnion(a: BBox, b: BBox): number {

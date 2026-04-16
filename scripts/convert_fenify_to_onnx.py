@@ -80,6 +80,7 @@ def export_onnx(model_path: str) -> None:
             dummy,
             OUTPUT_ONNX,
             opset_version=17,
+            dynamo=False,
             input_names=["input"],
             output_names=["output"],
             # Fixed batch=1; no dynamic axes needed for inference

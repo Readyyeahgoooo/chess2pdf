@@ -1,4 +1,4 @@
-import { MAX_PDF_PAGES } from "@/lib/constants";
+import { MAX_PDF_PAGES, STARTING_FEN } from "@/lib/constants";
 import { parseRecognizedLine } from "@/lib/move-parser";
 import type { BBox, DetectedDiagram, PdfPagePreview, RecognizedLine } from "@/lib/types";
 
@@ -13,6 +13,11 @@ export type PageScanResult = {
   page: RenderedPage;
   diagrams: DetectedDiagram[];
   lines: RecognizedLine[];
+};
+
+export type BoardScanResult = {
+  diagram: DetectedDiagram;
+  line: RecognizedLine;
 };
 
 export async function loadPdfDocument(file: File): Promise<PdfDocument> {
@@ -62,23 +67,23 @@ export function detectBoardCandidates(canvas: HTMLCanvasElement): Array<BBox & {
     return [];
   }
 
-  const minSize = Math.max(120, Math.floor(Math.min(canvas.width, canvas.height) * 0.16));
-  const maxSize = Math.floor(Math.min(canvas.width, canvas.height) * 0.62);
+  const minSize = Math.max(96, Math.floor(Math.min(canvas.width, canvas.height) * 0.11));
+  const maxSize = Math.floor(Math.min(canvas.width, canvas.height) * 0.72);
   const candidates: Array<BBox & { confidence: number }> = [];
 
-  for (let size = maxSize; size >= minSize; size -= Math.max(18, Math.floor(size / 7))) {
-    const step = Math.max(24, Math.floor(size / 4));
+  for (let size = maxSize; size >= minSize; size -= Math.max(12, Math.floor(size / 10))) {
+    const step = Math.max(12, Math.floor(size / 6));
     for (let y = 0; y <= canvas.height - size; y += step) {
       for (let x = 0; x <= canvas.width - size; x += step) {
         const confidence = scoreBoardCandidate(context, x, y, size);
-        if (confidence > 0.48) {
+        if (confidence > 0.36) {
           candidates.push({ x, y, width: size, height: size, confidence });
         }
       }
     }
   }
 
-  return nonOverlapping(candidates.sort((a, b) => b.confidence - a.confidence)).slice(0, 6);
+  return nonOverlapping(candidates.sort((a, b) => b.confidence - a.confidence)).slice(0, 8);
 }
 
 export function classifyBoardFen(canvas: HTMLCanvasElement, bbox: BBox): { fen: string; confidence: number; notes: string[] } {
@@ -100,9 +105,12 @@ export function classifyBoardFen(canvas: HTMLCanvasElement, bbox: BBox): { fen: 
     };
   }
 
+  // inferOccupancyFen only produces pawn-only positions which are misleading;
+  // fall through to lowConfidenceFen (STARTING_FEN) so the user has a
+  // recognisable starting point to correct from.
   return lowConfidenceFen([
-    "A board-like grid was found, but piece classification needs correction.",
-    "Use FEN paste or edit mode to set the exact position.",
+    "A board-like grid was found, but piece types cannot be determined from pixel data alone.",
+    "Paste the correct FEN in \"Edit position / FEN\" below the board.",
   ]);
 }
 
@@ -147,7 +155,7 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
   const diagrams: DetectedDiagram[] = [];
   const lines: RecognizedLine[] = [];
 
-  for (const candidate of candidates.slice(0, 3)) {
+  for (const candidate of candidates.slice(0, 6)) {
     const classification = classifyBoardFen(page.canvas, candidate);
     const diagram: DetectedDiagram = {
       id: crypto.randomUUID(),
@@ -189,9 +197,55 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
   return { page, diagrams, lines };
 }
 
+export async function scanManualBoard(page: RenderedPage, bbox: BBox): Promise<BoardScanResult> {
+  const normalized = clampSquareBox(bbox, page.width, page.height);
+  const classification = classifyBoardFen(page.canvas, normalized);
+  const diagram: DetectedDiagram = {
+    id: crypto.randomUUID(),
+    pageIndex: page.pageIndex,
+    bbox: normalized,
+    fen: classification.fen,
+    confidence: Math.max(0.42, classification.confidence),
+    orientation: "white",
+    sourceCropUrl: cropToDataUrl(page.canvas, normalized),
+    notes: ["Manual crop. Check piece identities before deep analysis."],
+  };
+
+  try {
+    const ocr = await recognizeChessText(page.canvas, normalized);
+    const parsed = parseRecognizedLine(ocr.text, diagram.fen);
+    return {
+      diagram,
+      line: {
+        id: crypto.randomUUID(),
+        diagramId: diagram.id,
+        rawText: ocr.text,
+        normalizedText: parsed.normalizedText,
+        sanMoves: parsed.sanMoves,
+        confidence: Math.min(ocr.confidence, parsed.confidence),
+        parseErrors: parsed.parseErrors,
+      },
+    };
+  } catch (error) {
+    return {
+      diagram,
+      line: {
+        id: crypto.randomUUID(),
+        diagramId: diagram.id,
+        rawText: "",
+        normalizedText: "",
+        sanMoves: [],
+        confidence: 0,
+        parseErrors: [error instanceof Error ? error.message : "OCR failed"],
+      },
+    };
+  }
+}
+
 function lowConfidenceFen(notes: string[]) {
+  // Fall back to STARTING_FEN: at least opening book lines will be legal from here.
   return {
-    fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    fen: STARTING_FEN,
     confidence: 0.28,
     notes,
   };
@@ -217,14 +271,26 @@ function cropToDataUrl(source: HTMLCanvasElement, bbox: BBox): string {
 }
 
 function textRectangle(canvas: HTMLCanvasElement, bbox: BBox) {
-  const top = Math.max(0, Math.floor(bbox.y - bbox.height * 0.25));
-  const bottom = Math.min(canvas.height, Math.floor(bbox.y + bbox.height * 1.85));
+  // Extend capture area: book lines often appear to the right of or below the diagram.
+  // Extra right margin (× 1.6) and a larger bottom margin (× 2.4) to capture multi-line
+  // move sequences that may be printed beneath the board.
+  const left = Math.max(0, Math.floor(bbox.x - bbox.width * 0.12));
+  const top = Math.max(0, Math.floor(bbox.y - bbox.height * 0.08));
+  const right = Math.min(canvas.width, Math.floor(bbox.x + bbox.width * 1.6));
+  const bottom = Math.min(canvas.height, Math.floor(bbox.y + bbox.height * 2.4));
   return {
-    left: 0,
+    left,
     top,
-    width: canvas.width,
+    width: Math.max(140, right - left),
     height: Math.max(80, bottom - top),
   };
+}
+
+function clampSquareBox(bbox: BBox, width: number, height: number): BBox {
+  const size = Math.max(32, Math.min(bbox.width, bbox.height, width, height));
+  const x = Math.max(0, Math.min(width - size, bbox.x));
+  const y = Math.max(0, Math.min(height - size, bbox.y));
+  return { x, y, width: size, height: size };
 }
 
 function scoreBoardCandidate(context: CanvasRenderingContext2D, x: number, y: number, size: number): number {
@@ -322,11 +388,77 @@ function standardDeviation(values: number[]): number {
 function nonOverlapping(candidates: Array<BBox & { confidence: number }>) {
   const kept: Array<BBox & { confidence: number }> = [];
   for (const candidate of candidates) {
-    if (kept.every((existing) => intersectionOverUnion(existing, candidate) < 0.25)) {
+    if (kept.every((existing) => intersectionOverUnion(existing, candidate) < 0.4)) {
       kept.push(candidate);
     }
   }
   return kept;
+}
+
+function inferOccupancyFen(occupancy: number[]): string | null {
+  const board = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => ""));
+  const occupied = occupancy
+    .map((density, index) => ({ density, index }))
+    .filter((sample) => sample.density > 0.21)
+    .sort((a, b) => b.density - a.density);
+
+  if (occupied.length < 6) {
+    return null;
+  }
+
+  board[0][4] = "k";
+  board[7][4] = "K";
+  let whitePawns = 0;
+  let blackPawns = 0;
+
+  for (const square of occupied) {
+    const rank = Math.floor(square.index / 8);
+    const file = square.index % 8;
+    if ((rank === 0 && file === 4) || (rank === 7 && file === 4)) {
+      continue;
+    }
+    if (rank === 0 || rank === 7) {
+      continue;
+    }
+
+    const isBlackHalf = rank <= 3;
+    if (isBlackHalf) {
+      if (blackPawns >= 8) {
+        continue;
+      }
+      board[rank][file] = "p";
+      blackPawns += 1;
+      continue;
+    }
+
+    if (whitePawns >= 8) {
+      continue;
+    }
+    board[rank][file] = "P";
+    whitePawns += 1;
+  }
+
+  const rows = board.map((row) => {
+    let result = "";
+    let empty = 0;
+    for (const cell of row) {
+      if (!cell) {
+        empty += 1;
+        continue;
+      }
+      if (empty > 0) {
+        result += String(empty);
+        empty = 0;
+      }
+      result += cell;
+    }
+    if (empty > 0) {
+      result += String(empty);
+    }
+    return result;
+  });
+
+  return `${rows.join("/")} w - - 0 1`;
 }
 
 function intersectionOverUnion(a: BBox, b: BBox): number {

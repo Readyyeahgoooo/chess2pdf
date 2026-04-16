@@ -1,15 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
-import { DEFAULT_DEPTH, MAX_CACHED_CANVASES, OCR_CONCURRENCY, SAMPLE_FENS, STARTING_FEN } from "@/lib/constants";
+import { DEFAULT_DEPTH, MAX_CACHED_CANVASES, OCR_CONCURRENCY, STARTING_FEN } from "@/lib/constants";
 import { clearFen, isSquare, isValidFen, movePieceInFen, placePieceInFen, safeFen } from "@/lib/fen-editor";
 import { validatePdfFile } from "@/lib/file-validation";
 import { lineToPgn, parseRecognizedLine } from "@/lib/move-parser";
 import {
   loadPdfDocument,
   renderPdfPage,
+  scanManualBoard,
   scanRenderedPage,
   type PdfDocument,
   type RenderedPage,
@@ -17,7 +18,10 @@ import {
 import { clearLocalData, listSessions, saveSession } from "@/lib/storage";
 import { StockfishClient } from "@/lib/stockfish";
 import type { ChessAiMode, ChessAiResponse } from "@/lib/ai-chess";
-import type { DetectedDiagram, EngineEval, PdfPagePreview, PdfSession, PieceCode, RecognizedLine, ScanStatus } from "@/lib/types";
+import type { BBox, DetectedDiagram, EngineEval, PdfPagePreview, PdfSession, PieceCode, RecognizedLine, ScanStatus } from "@/lib/types";
+
+// Always auto-apply detected boards; STARTING_FEN is the fallback so it is always legal.
+const AUTO_APPLY_CONFIDENCE = 0;
 
 const PIECES: PieceCode[] = ["wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP"];
 const PIECE_LABEL: Record<PieceCode, string> = {
@@ -36,6 +40,7 @@ const PIECE_LABEL: Record<PieceCode, string> = {
 };
 
 type BoardOrientation = "white" | "black";
+type CropPoint = { x: number; y: number };
 
 export function Chess2PdfApp() {
   const [status, setStatus] = useState<ScanStatus>("ready");
@@ -45,25 +50,32 @@ export function Chess2PdfApp() {
   const [fileMeta, setFileMeta] = useState<{ name: string; size: number } | null>(null);
   const [pages, setPages] = useState<PdfPagePreview[]>([]);
   const [totalPages, setTotalPages] = useState(0);
+  const [scannedPages, setScannedPages] = useState<number[]>([]);
   const [currentPage, setCurrentPage] = useState(0);
   const [scanRangeStart, setScanRangeStart] = useState(1);
   const [scanRangeEnd, setScanRangeEnd] = useState(1);
   const [diagrams, setDiagrams] = useState<DetectedDiagram[]>([]);
   const [lines, setLines] = useState<RecognizedLine[]>([]);
   const [selectedDiagramId, setSelectedDiagramId] = useState<string | null>(null);
+  const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PdfSession[]>([]);
   const [fen, setFen] = useState(STARTING_FEN);
   const [fenDraft, setFenDraft] = useState(STARTING_FEN);
   const [playedMoves, setPlayedMoves] = useState<string[]>([]);
   const [deviationPly, setDeviationPly] = useState<number | undefined>();
   const [engineEval, setEngineEval] = useState<EngineEval | undefined>();
-  const [engineStatus, setEngineStatus] = useState("idle");
+  const [bookEval, setBookEval] = useState<EngineEval | undefined>();
+  const [evalDeltaCp, setEvalDeltaCp] = useState<number | undefined>();
+  const [engineStatus, setEngineStatus] = useState("Engine idle");
   const [orientation, setOrientation] = useState<BoardOrientation>("white");
   const [editMode, setEditMode] = useState(false);
   const [selectedPiece, setSelectedPiece] = useState<PieceCode | null>("wQ");
   const [ocrTextDraft, setOcrTextDraft] = useState("");
   const [aiStatus, setAiStatus] = useState("AI coach idle");
   const [aiResult, setAiResult] = useState<ChessAiResponse | null>(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [cropStart, setCropStart] = useState<CropPoint | null>(null);
+  const [cropBox, setCropBox] = useState<BBox | null>(null);
 
   const canvasesRef = useRef(new Map<number, HTMLCanvasElement>());
   const pagePreviewsRef = useRef(new Map<number, PdfPagePreview>());
@@ -74,8 +86,16 @@ export function Chess2PdfApp() {
 
   const selectedDiagram = diagrams.find((diagram) => diagram.id === selectedDiagramId) ?? diagrams[0];
   const selectedLines = selectedDiagram ? lines.filter((line) => line.diagramId === selectedDiagram.id) : lines;
-  const expectedLine = selectedLines.find((line) => line.sanMoves.length > 0) ?? selectedLines[0];
+  const expectedLine = selectedLines.find((line) => line.id === selectedLineId) ?? selectedLines.find((line) => line.sanMoves.length > 0) ?? selectedLines[0];
   const pagePreviewMap = useMemo(() => new Map(pages.map((page) => [page.pageIndex, page])), [pages]);
+  const scannedPageSet = useMemo(() => new Set(scannedPages), [scannedPages]);
+  const diagramCountByPage = useMemo(() => {
+    const counts = new Map<number, number>();
+    for (const diagram of diagrams) {
+      counts.set(diagram.pageIndex, (counts.get(diagram.pageIndex) ?? 0) + 1);
+    }
+    return counts;
+  }, [diagrams]);
   const currentChess = useMemo(() => {
     try {
       return new Chess(fen);
@@ -91,7 +111,9 @@ export function Chess2PdfApp() {
     setPlayedMoves([]);
     setDeviationPly(undefined);
     setEngineEval(undefined);
-    setEngineStatus("idle");
+    setBookEval(undefined);
+    setEvalDeltaCp(undefined);
+    setEngineStatus("Engine idle");
   }, []);
 
   const refreshSessions = useCallback(async () => {
@@ -127,6 +149,7 @@ export function Chess2PdfApp() {
       canvasesRef.current.clear();
       pagePreviewsRef.current.clear();
       scannedPagesRef.current.clear();
+      setScannedPages([]);
       const document = await loadPdfDocument(file);
       pdfRef.current = document;
       setHasPdfLoaded(true);
@@ -138,6 +161,13 @@ export function Chess2PdfApp() {
       setDiagrams([]);
       setLines([]);
       setSelectedDiagramId(null);
+      setSelectedLineId(null);
+      setCropMode(false);
+      setCropStart(null);
+      setCropBox(null);
+      setBookEval(undefined);
+      setEvalDeltaCp(undefined);
+      setEngineStatus("Engine idle");
       setCurrentPage(0);
       setProgress(`Opened ${document.numPages} page${document.numPages === 1 ? "" : "s"}. Rendering page 1...`);
       await renderAndCachePage(document, 0);
@@ -162,7 +192,7 @@ export function Chess2PdfApp() {
     scanRunRef.current = runId;
     setStatus("scanning");
     setError("");
-    setProgress(`Scanning ${indices.length} page${indices.length === 1 ? "" : "s"} locally...`);
+    setProgress(`Scanning ${indices.length} page${indices.length === 1 ? "" : "s"} for boards and lines...`);
 
     const queue = [...indices];
     const newDiagrams: DetectedDiagram[] = [];
@@ -196,20 +226,32 @@ export function Chess2PdfApp() {
     for (const pageIndex of indices) {
       scannedPagesRef.current.add(pageIndex);
     }
+    setScannedPages(Array.from(scannedPagesRef.current.values()).sort((a, b) => a - b));
 
-    const first = newDiagrams[0];
-    if (first) {
-      setSelectedDiagramId(first.id);
-      resetBoard(first.fen);
-      const firstLine = newLines.find((line) => line.diagramId === first.id);
-      setOcrTextDraft(firstLine?.rawText || "");
+    const mergedDiagrams = mergeById(diagrams, newDiagrams, (item) => item.id);
+    const mergedLines = mergeById(lines, newLines, (item) => item.id);
+
+    // Use indices[0] as the priority page, since currentPage may still hold the
+    // previous value (React state updates are async, not yet flushed).
+    const priorityPage = indices[0] ?? currentPage;
+    const currentPageDiagram = bestDiagramForPage(priorityPage, mergedDiagrams);
+    const firstDetected = currentPageDiagram ?? newDiagrams[0];
+    if (firstDetected) {
+      await selectDiagram(firstDetected, mergedLines, { auto: true });
     }
 
-    setProgress(newDiagrams.length > 0 ? "Scan complete. Confirm FEN and moves before serious study." : "No board-like diagram found on that page.");
+    const scannedCount = indices.length;
+    const foundDiagramCount = newDiagrams.length;
+    const foundLineCount = newLines.filter((line) => line.sanMoves.length > 0).length;
+    setProgress(
+      foundDiagramCount > 0
+        ? `Scan complete: ${foundDiagramCount} board${foundDiagramCount === 1 ? "" : "s"} and ${foundLineCount} parsed line${foundLineCount === 1 ? "" : "s"} across ${scannedCount} page${scannedCount === 1 ? "" : "s"}.`
+        : "No board-like diagram found in that scan range.",
+    );
     setStatus("ready");
 
-    const session = buildSession(newDiagrams, newLines);
-    if (session) {
+    const session = buildSession(mergedDiagrams, mergedLines);
+    if (session && (newDiagrams.length > 0 || foundLineCount > 0)) {
       await saveSession(session);
       await refreshSessions();
     }
@@ -239,13 +281,9 @@ export function Chess2PdfApp() {
       setProgress(`Scanning page ${boundedPageIndex + 1} for diagrams...`);
       await scanPages([boundedPageIndex]);
     } else {
-      // page already scanned — auto-select its first diagram if nothing is selected
-      const pageFirstDiagram = diagrams.find((d) => d.pageIndex === boundedPageIndex);
+      const pageFirstDiagram = bestDiagramForPage(boundedPageIndex, diagrams);
       if (pageFirstDiagram) {
-        setSelectedDiagramId(pageFirstDiagram.id);
-        resetBoard(pageFirstDiagram.fen);
-        const diagramLine = lines.find((l) => l.diagramId === pageFirstDiagram.id);
-        setOcrTextDraft(diagramLine?.rawText ?? "");
+        await selectDiagram(pageFirstDiagram, lines, { auto: true, navigate: false });
       }
     }
   }
@@ -298,12 +336,35 @@ export function Chess2PdfApp() {
     setProgress("Cancelling after the current OCR job...");
   }
 
-  function selectDiagram(diagram: DetectedDiagram) {
+  function bestDiagramForPage(pageIndex: number, sourceDiagrams: DetectedDiagram[]) {
+    return sourceDiagrams
+      .filter((diagram) => diagram.pageIndex === pageIndex)
+      .sort((a, b) => b.confidence - a.confidence)[0];
+  }
+
+  async function selectDiagram(
+    diagram: DetectedDiagram,
+    sourceLines = lines,
+    options: { auto?: boolean; navigate?: boolean } = {},
+  ) {
+    const shouldNavigatePage = options.navigate ?? true;
     setSelectedDiagramId(diagram.id);
-    void navigateToPage(diagram.pageIndex);
-    resetBoard(diagram.fen);
-    const line = lines.find((item) => item.diagramId === diagram.id);
+    if (shouldNavigatePage && diagram.pageIndex !== currentPage) {
+      setCurrentPage(diagram.pageIndex);
+    }
+    const line = sourceLines.find((item) => item.diagramId === diagram.id);
+    setSelectedLineId(line?.id ?? null);
     setOcrTextDraft(line?.rawText || "");
+    resetBoard(diagram.fen);
+    if (diagram.confidence < 0.45) {
+      const moveCount = line?.sanMoves.length ?? 0;
+      setProgress(
+        moveCount > 0
+          ? `Board loaded (low confidence). ${moveCount} move${moveCount === 1 ? "" : "s"} detected — step through with the move buttons or chips.`
+          : "Board loaded. Confidence is low — paste the correct FEN in the position section if the pieces look wrong.",
+      );
+    }
+    await analyzePosition(diagram.fen);
   }
 
   function applyFenDraft() {
@@ -313,6 +374,8 @@ export function Chess2PdfApp() {
     }
     setError("");
     resetBoard(fenDraft);
+    setProgress("FEN applied.");
+    void analyzePosition(fenDraft);
   }
 
   function reparseOcrDraft() {
@@ -332,6 +395,7 @@ export function Chess2PdfApp() {
       const without = current.filter((line) => line.id !== updated.id);
       return [...without, updated];
     });
+    setSelectedLineId(updated.id);
     setProgress(`Parsed ${updated.sanMoves.length} legal move${updated.sanMoves.length === 1 ? "" : "s"}.`);
   }
 
@@ -360,6 +424,7 @@ export function Chess2PdfApp() {
     }
 
     try {
+      const positionBeforeMove = game.fen();
       const move = game.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
       if (!move) {
         return false;
@@ -367,13 +432,23 @@ export function Chess2PdfApp() {
       const nextMoves = [...playedMoves, move.san];
       const expected = expectedLine?.sanMoves[playedMoves.length];
       const deviated = expected !== undefined && move.san !== expected;
+      let expectedReplyFen: string | undefined;
+      if (deviated && expected) {
+        try {
+          const expectedGame = new Chess(positionBeforeMove);
+          const expectedMove = expectedGame.move(expected, { strict: false });
+          expectedReplyFen = expectedMove ? expectedGame.fen() : undefined;
+        } catch {
+          expectedReplyFen = undefined;
+        }
+      }
       setFen(game.fen());
       setFenDraft(game.fen());
       setPlayedMoves(nextMoves);
       if (deviated && deviationPly === undefined) {
         setDeviationPly(nextMoves.length);
-        void analyzePosition(game.fen());
       }
+      void analyzePosition(game.fen(), expectedReplyFen);
       return true;
     } catch {
       return false;
@@ -389,6 +464,10 @@ export function Chess2PdfApp() {
     setFenDraft(nextFen);
     setPlayedMoves([]);
     setDeviationPly(undefined);
+    setEngineEval(undefined);
+    setBookEval(undefined);
+    setEvalDeltaCp(undefined);
+    setEngineStatus("Engine idle");
   }
 
   function playExpectedMove() {
@@ -407,7 +486,9 @@ export function Chess2PdfApp() {
     }
     setFen(currentChess.fen());
     setFenDraft(currentChess.fen());
-    setPlayedMoves([...playedMoves, move.san]);
+    const nextMoves = [...playedMoves, move.san];
+    setPlayedMoves(nextMoves);
+    void analyzePosition(currentChess.fen());
   }
 
   function undoMove() {
@@ -423,20 +504,56 @@ export function Chess2PdfApp() {
     if (deviationPly !== undefined && nextMoves.length < deviationPly) {
       setDeviationPly(undefined);
     }
+    void analyzePosition(game.fen());
   }
 
-  async function analyzePosition(targetFen = fen) {
+  function jumpToPly(targetPly: number) {
+    if (!expectedLine) {
+      return;
+    }
+    const source = safeFen(selectedDiagram?.fen ?? STARTING_FEN);
+    const game = new Chess(source);
+    const bounded = Math.max(0, Math.min(expectedLine.sanMoves.length, targetPly));
+    const nextMoves: string[] = [];
+    for (let index = 0; index < bounded; index += 1) {
+      const san = expectedLine.sanMoves[index];
+      const moved = game.move(san, { strict: false });
+      if (!moved) {
+        break;
+      }
+      nextMoves.push(moved.san);
+    }
+    setFen(game.fen());
+    setFenDraft(game.fen());
+    setPlayedMoves(nextMoves);
+    setDeviationPly(undefined);
+    void analyzePosition(game.fen());
+  }
+
+  async function analyzePosition(targetFen = fen, compareFen?: string) {
     if (!isValidFen(targetFen)) {
       setError("Stockfish needs a valid FEN with both kings.");
       return;
     }
     setEngineStatus(`Analyzing to depth ${DEFAULT_DEPTH} locally...`);
+    setEvalDeltaCp(undefined);
+    setBookEval(undefined);
     try {
       const result = await stockfishRef.current?.evaluate(targetFen, DEFAULT_DEPTH);
       if (result) {
         setEngineEval(result);
-        setEngineStatus("Analysis ready");
       }
+      if (compareFen && isValidFen(compareFen)) {
+        setEngineStatus("Comparing against the book move...");
+        const expected = await stockfishRef.current?.evaluate(compareFen, DEFAULT_DEPTH);
+        if (expected) {
+          setBookEval(expected);
+          if (result?.scoreCp !== undefined && expected.scoreCp !== undefined) {
+            setEvalDeltaCp(result.scoreCp - expected.scoreCp);
+          }
+        }
+      }
+      setEngineStatus("Analysis ready");
     } catch (analysisError) {
       setEngineStatus(analysisError instanceof Error ? analysisError.message : "Engine failed");
     }
@@ -492,6 +609,37 @@ export function Chess2PdfApp() {
     setProgress("History cleared.");
   }
 
+  async function restoreSession(session: PdfSession) {
+    setFileMeta({ name: session.fileName, size: session.fileSize });
+    setPages(session.pages);
+    setDiagrams(session.diagrams);
+    setLines(session.exercises);
+    const inferredPages = Math.max(
+      session.pages.reduce((max, page) => Math.max(max, page.pageIndex), 0) + 1,
+      session.diagrams.reduce((max, diagram) => Math.max(max, diagram.pageIndex), 0) + 1,
+    );
+    setTotalPages(inferredPages);
+    setHasPdfLoaded(session.pages.length > 0 || session.diagrams.length > 0);
+    if (session.diagrams.length > 0) {
+      setCurrentPage(session.diagrams[0].pageIndex);
+      await selectDiagram(session.diagrams[0], session.exercises, { navigate: false });
+    } else {
+      setProgress(`Loaded ${session.fileName}, but no boards were stored in that session.`);
+    }
+  }
+
+  function selectLine(line: RecognizedLine) {
+    setSelectedLineId(line.id);
+    setOcrTextDraft(line.rawText);
+    const diagram = diagrams.find((item) => item.id === line.diagramId);
+    if (diagram) {
+      setSelectedDiagramId(diagram.id);
+      const sourceFen = safeFen(diagram.fen);
+      resetBoard(sourceFen);
+      void analyzePosition(sourceFen);
+    }
+  }
+
   function scanSelectedRange() {
     if (!totalPages) {
       return;
@@ -502,8 +650,93 @@ export function Chess2PdfApp() {
     void scanPages(indices);
   }
 
-  const currentPreview = pages.find((page) => page.pageIndex === currentPage);
-  const visiblePageDiagrams = diagrams.filter((diagram) => diagram.pageIndex === currentPage);
+  async function scanManualCrop() {
+    const document = pdfRef.current;
+    if (!document || !cropBox) {
+      return;
+    }
+
+    setStatus("scanning");
+    setProgress(`Scanning manual crop on page ${currentPage + 1}...`);
+    setError("");
+
+    try {
+      const rendered = await getRenderedPage(document, currentPage);
+      const result = await scanManualBoard(rendered, cropBox);
+      const mergedDiagrams = mergeById(diagrams, [result.diagram], (item) => item.id);
+      const mergedLines = mergeById(lines, [result.line], (item) => item.id);
+      setDiagrams(mergedDiagrams);
+      setLines(mergedLines);
+      scannedPagesRef.current.add(currentPage);
+      setScannedPages(Array.from(scannedPagesRef.current.values()).sort((a, b) => a - b));
+      setCropMode(false);
+      setCropStart(null);
+      setCropBox(null);
+      await selectDiagram(result.diagram, mergedLines);
+      setProgress(
+        result.line.sanMoves.length
+          ? `Manual crop added with ${result.line.sanMoves.length} parsed move${result.line.sanMoves.length === 1 ? "" : "s"}.`
+          : "Manual crop added. Correct the OCR text or FEN if needed.",
+      );
+
+      const session = buildSession(mergedDiagrams, mergedLines);
+      if (session) {
+        await saveSession(session);
+        await refreshSessions();
+      }
+    } catch (cropError) {
+      setError(cropError instanceof Error ? cropError.message : "Manual crop failed.");
+    } finally {
+      setStatus("ready");
+    }
+  }
+
+  function beginCrop(event: PointerEvent<HTMLDivElement>) {
+    if (!cropMode || !currentPreview) {
+      return;
+    }
+    const point = cropPointFromEvent(event, currentPreview);
+    setCropStart(point);
+    setCropBox({ x: point.x, y: point.y, width: 1, height: 1 });
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function updateCrop(event: PointerEvent<HTMLDivElement>) {
+    if (!cropMode || !cropStart || !currentPreview) {
+      return;
+    }
+    setCropBox(squareFromPoints(cropStart, cropPointFromEvent(event, currentPreview), currentPreview));
+  }
+
+  function finishCrop(event: PointerEvent<HTMLDivElement>) {
+    if (!cropMode || !cropStart || !currentPreview) {
+      return;
+    }
+    setCropBox(squareFromPoints(cropStart, cropPointFromEvent(event, currentPreview), currentPreview));
+    setCropStart(null);
+  }
+
+  function moveDiagramSelection(offset: number) {
+    if (!visiblePageDiagrams.length) {
+      return;
+    }
+    const currentIndex = selectedPageDiagramIndex >= 0 ? selectedPageDiagramIndex : 0;
+    const nextIndex = Math.max(0, Math.min(visiblePageDiagrams.length - 1, currentIndex + offset));
+    const nextDiagram = visiblePageDiagrams[nextIndex];
+    if (nextDiagram) {
+      void selectDiagram(nextDiagram, lines, { navigate: false });
+    }
+  }
+
+  const currentPreview = pagePreviewMap.get(currentPage);
+  const visiblePageDiagrams = diagrams.filter((diagram) => diagram.pageIndex === currentPage).sort((a, b) => b.confidence - a.confidence);
+  const visiblePageLineItems = visiblePageDiagrams.flatMap((diagram, diagramIndex) =>
+    lines
+      .filter((line) => line.diagramId === diagram.id)
+      .map((line) => ({ diagram, diagramIndex, line })),
+  );
+  const selectedPageDiagramIndex = selectedDiagram ? visiblePageDiagrams.findIndex((diagram) => diagram.id === selectedDiagram.id) : -1;
+  const selectedPageDiagramNumber = selectedPageDiagramIndex >= 0 ? selectedPageDiagramIndex + 1 : 0;
   const evalText = formatEval(engineEval);
   const lichessUrl = `https://lichess.org/analysis/standard/${fen.replace(/\s/g, "_")}`;
 
@@ -615,6 +848,8 @@ export function Chess2PdfApp() {
                 <div className="grid grid-cols-4 gap-2">
                   {Array.from({ length: totalPages }, (_, index) => {
                     const preview = pagePreviewMap.get(index);
+                    const diagramCount = diagramCountByPage.get(index) ?? 0;
+                    const isScanned = scannedPageSet.has(index);
                     return (
                       <button
                         key={index}
@@ -626,7 +861,9 @@ export function Chess2PdfApp() {
                         {preview ? (
                           <img className="mx-auto mb-1 max-h-12 rounded object-contain" src={preview.thumbnailUrl} alt={`PDF page ${index + 1}`} />
                         ) : null}
-                        {index + 1}
+                        <span>{index + 1}</span>
+                        {diagramCount > 0 ? <span className="ml-1 text-accent">{diagramCount}</span> : null}
+                        {diagramCount === 0 && isScanned ? <span className="ml-1 text-muted">done</span> : null}
                       </button>
                     );
                   })}
@@ -649,11 +886,37 @@ export function Chess2PdfApp() {
                   <button className="rounded-md border border-line px-3 py-2 font-semibold" onClick={() => setEditMode(!editMode)}>
                     {editMode ? "Play mode" : "Edit mode"}
                   </button>
-                  <button className="rounded-md border border-line px-3 py-2 font-semibold" onClick={() => resetBoard(selectedDiagram?.fen ?? STARTING_FEN)}>
+                  <button
+                    className="rounded-md border border-line px-3 py-2 font-semibold"
+                    onClick={() => {
+                      const sourceFen = safeFen(selectedDiagram?.fen ?? STARTING_FEN);
+                      resetBoard(sourceFen);
+                      void analyzePosition(sourceFen);
+                    }}
+                  >
                     Reset
+                  </button>
+                  <button
+                    className="rounded-md border border-line px-3 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={selectedPageDiagramIndex <= 0}
+                    onClick={() => moveDiagramSelection(-1)}
+                  >
+                    Prev board
+                  </button>
+                  <button
+                    className="rounded-md border border-line px-3 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={!visiblePageDiagrams.length || selectedPageDiagramIndex >= visiblePageDiagrams.length - 1}
+                    onClick={() => moveDiagramSelection(1)}
+                  >
+                    Next board
                   </button>
                 </div>
               </div>
+              {visiblePageDiagrams.length > 0 ? (
+                <p className="mb-3 text-sm text-muted">
+                  Page {currentPage + 1} board {selectedPageDiagramNumber || 1} of {visiblePageDiagrams.length}
+                </p>
+              ) : null}
 
               <div className="mx-auto max-w-[620px]">
                 <Chessboard
@@ -696,6 +959,11 @@ export function Chess2PdfApp() {
                         setFen(next);
                         setFenDraft(next);
                         setPlayedMoves([]);
+                        setDeviationPly(undefined);
+                        setEngineEval(undefined);
+                        setBookEval(undefined);
+                        setEvalDeltaCp(undefined);
+                        setEngineStatus("Engine idle");
                       }}
                     >
                       Clear board
@@ -704,8 +972,57 @@ export function Chess2PdfApp() {
                 </div>
               ) : null}
 
-              <div className="mt-4 grid gap-3 md:grid-cols-2">
-                <div>
+              {/* Compact engine eval bar */}
+              <div className="mt-3 flex flex-wrap items-center gap-3 rounded-md bg-background px-3 py-2 text-sm">
+                <span className={`font-semibold ${engineEval && (engineEval.scoreCp ?? 0) < -30 ? "text-bad" : "text-accent"}`}>{evalText}</span>
+                {engineEval?.bestMove ? (
+                  <span className="text-muted">
+                    Best: <span className="font-medium text-foreground">{engineEval.bestMove}</span>
+                  </span>
+                ) : null}
+                {evalDeltaCp !== undefined ? (
+                  <span className={`font-semibold ${evalDeltaCp <= -20 ? "text-bad" : "text-accent"}`}>
+                    Deviation: {formatCpDelta(evalDeltaCp)}
+                  </span>
+                ) : null}
+                <span className="ml-auto text-xs text-muted">{engineStatus}</span>
+              </div>
+              {/* Move step controls */}
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  className="rounded-md border border-line px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!playedMoves.length}
+                  onClick={undoMove}
+                >
+                  ← Prev
+                </button>
+                <button
+                  className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!expectedLine?.sanMoves.length || playedMoves.length >= (expectedLine?.sanMoves.length ?? 0)}
+                  onClick={playExpectedMove}
+                >
+                  Next →
+                </button>
+                <button
+                  className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!playedMoves.length}
+                  onClick={() => jumpToPly(0)}
+                >
+                  Reset line
+                </button>
+                <button
+                  className="rounded-md border border-line px-3 py-2 text-sm font-semibold"
+                  onClick={() => void analyzePosition()}
+                >
+                  Analyze
+                </button>
+              </div>
+              {/* Position / FEN — collapsed to reduce noise */}
+              <details className="mt-3">
+                <summary className="cursor-pointer rounded px-1 py-1 text-xs font-semibold text-muted hover:text-foreground">
+                  Position / FEN (advanced)
+                </summary>
+                <div className="mt-2">
                   <label className="mb-1 block text-sm font-semibold" htmlFor="fen-input">
                     Current FEN
                   </label>
@@ -727,59 +1044,51 @@ export function Chess2PdfApp() {
                     </a>
                   </div>
                 </div>
-                <div>
-                  <label className="mb-1 block text-sm font-semibold" htmlFor="sample-fen">
-                    Quick positions
-                  </label>
-                  <select
-                    id="sample-fen"
-                    className="w-full rounded-md border border-line bg-white p-3 text-sm"
-                    onChange={(event) => resetBoard(event.target.value)}
-                    value=""
-                  >
-                    <option value="" disabled>
-                      Choose a sample or recognized FEN
-                    </option>
-                    {SAMPLE_FENS.map((sample) => (
-                      <option key={sample.label} value={sample.fen}>
-                        {sample.label}
-                      </option>
-                    ))}
-                    {diagrams.map((diagram, index) => (
-                      <option key={diagram.id} value={diagram.fen}>
-                        PDF diagram {index + 1}, {Math.round(diagram.confidence * 100)} percent confidence
-                      </option>
-                    ))}
-                  </select>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <button
-                      className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
-                      disabled={!expectedLine?.sanMoves.length}
-                      onClick={playExpectedMove}
-                    >
-                      Play next book move
-                    </button>
-                    <button className="rounded-md border border-line px-3 py-2 text-sm font-semibold" onClick={undoMove}>
-                      Undo
-                    </button>
-                    <button className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white" onClick={() => void analyzePosition()}>
-                      Analyze
-                    </button>
-                  </div>
-                </div>
-              </div>
+              </details>
             </div>
 
             <div className="rounded-md border border-line bg-panel p-4">
-              <h2 className="mb-3 text-lg font-semibold">PDF page view</h2>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-lg font-semibold">PDF page view</h2>
+                  {cropMode ? <p className="text-sm text-muted">Drag a square around the board.</p> : null}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={!currentPreview || status === "scanning"}
+                    onClick={() => {
+                      setCropMode(!cropMode);
+                      setCropStart(null);
+                      setCropBox(null);
+                    }}
+                  >
+                    {cropMode ? "Cancel crop" : "Crop board"}
+                  </button>
+                  {cropMode ? (
+                    <button
+                      className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={!cropBox || cropBox.width < 32 || status === "scanning"}
+                      onClick={() => void scanManualCrop()}
+                    >
+                      Use crop
+                    </button>
+                  ) : null}
+                </div>
+              </div>
               {currentPreview ? (
                 <div className="relative mx-auto max-h-[720px] overflow-auto rounded-md border border-line bg-white">
-                  <div className="relative inline-block">
+                  <div
+                    className={`relative inline-block ${cropMode ? "cursor-crosshair" : ""}`}
+                    onPointerDown={beginCrop}
+                    onPointerMove={updateCrop}
+                    onPointerUp={finishCrop}
+                  >
                     <img className="max-w-none" src={currentPreview.imageUrl} alt={`Rendered PDF page ${currentPage + 1}`} />
                     {visiblePageDiagrams.map((diagram) => (
                       <button
                         key={diagram.id}
-                        className="absolute border-2 border-accent bg-[#147c6c33]"
+                        className={`absolute border-2 ${diagram.id === selectedDiagram?.id ? "border-accent bg-[#147c6c33]" : "border-[#147c6c88] bg-[#147c6c1f]"}`}
                         style={{
                           left: diagram.bbox.x,
                           top: diagram.bbox.y,
@@ -787,9 +1096,21 @@ export function Chess2PdfApp() {
                           height: diagram.bbox.height,
                         }}
                         title={`Detected diagram, ${Math.round(diagram.confidence * 100)} percent confidence`}
-                        onClick={() => selectDiagram(diagram)}
+                        disabled={cropMode}
+                        onClick={() => void selectDiagram(diagram)}
                       />
                     ))}
+                    {cropBox ? (
+                      <div
+                        className="pointer-events-none absolute border-2 border-bad bg-[#c5403030]"
+                        style={{
+                          left: cropBox.x,
+                          top: cropBox.y,
+                          width: cropBox.width,
+                          height: cropBox.height,
+                        }}
+                      />
+                    ) : null}
                   </div>
                 </div>
               ) : (
@@ -802,21 +1123,21 @@ export function Chess2PdfApp() {
 
           <aside className="grid gap-4">
             <div className="rounded-md border border-line bg-panel p-4">
-              <h2 className="text-lg font-semibold">Recognition</h2>
+              <h2 className="text-lg font-semibold">Detected boards</h2>
               <p className="mb-3 text-sm text-muted">
                 Automatic recognition is best effort. Low-confidence diagrams should be corrected before analysis.
               </p>
               <div className="space-y-3">
-                {diagrams.map((diagram, index) => (
+                {visiblePageDiagrams.map((diagram, index) => (
                   <button
                     key={diagram.id}
                     className={`block w-full rounded-md border p-3 text-left ${diagram.id === selectedDiagram?.id ? "border-accent bg-[#e8f5f1]" : "border-line bg-white"}`}
-                    onClick={() => selectDiagram(diagram)}
+                    onClick={() => void selectDiagram(diagram)}
                   >
                     <div className="flex gap-3">
                       {diagram.sourceCropUrl ? <img className="h-20 w-20 rounded object-cover" src={diagram.sourceCropUrl} alt={`Detected chess diagram ${index + 1}`} /> : null}
                       <div>
-                        <p className="font-semibold">Diagram {index + 1}</p>
+                        <p className="font-semibold">Board {index + 1}</p>
                         <p className="text-sm text-muted">Page {diagram.pageIndex + 1}, confidence {Math.round(diagram.confidence * 100)} percent</p>
                         {diagram.notes.map((note) => (
                           <p key={note} className="mt-1 text-xs text-warn">
@@ -827,7 +1148,9 @@ export function Chess2PdfApp() {
                     </div>
                   </button>
                 ))}
-                {diagrams.length === 0 ? <p className="rounded-md bg-background p-3 text-sm text-muted">No detected diagrams yet.</p> : null}
+                {visiblePageDiagrams.length === 0 ? (
+                  <p className="rounded-md bg-background p-3 text-sm text-muted">No detected boards on this page yet. Scan this page to populate boards.</p>
+                ) : null}
               </div>
             </div>
 
@@ -838,40 +1161,89 @@ export function Chess2PdfApp() {
                   Copy PGN
                 </button>
               </div>
-              <textarea
-                className="mb-2 min-h-28 w-full rounded-md border border-line bg-white p-3 text-sm"
-                value={ocrTextDraft}
-                onChange={(event) => setOcrTextDraft(event.target.value)}
-                placeholder="Paste or correct OCR move text here."
-              />
-              <button className="mb-3 rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white" onClick={reparseOcrDraft}>
-                Parse moves
-              </button>
-              <div className="rounded-md bg-background p-3 text-sm">
-                <p className="font-semibold">Recognized moves</p>
-                <p className="mt-1 leading-6">{expectedLine?.sanMoves.join(" ") || "No legal move line parsed yet."}</p>
+              {/* ── Multiple lines on page selector ── */}
+              {visiblePageLineItems.length > 1 ? (
+                <div className="mb-3 flex flex-wrap gap-1">
+                  {visiblePageLineItems.map(({ diagramIndex, line }) => (
+                    <button
+                      key={line.id}
+                      className={`rounded-md border px-2 py-1 text-xs font-semibold ${
+                        line.id === expectedLine?.id ? "border-accent bg-[#e8f5f1]" : "border-line bg-white"
+                      }`}
+                      onClick={() => selectLine(line)}
+                    >
+                      Board {diagramIndex + 1} ({line.sanMoves.length})
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {/* ── Clickable move chips (hero element) ── */}
+              <div className="rounded-md bg-background p-3">
+                {expectedLine?.sanMoves.length ? (
+                  <div className="flex flex-wrap gap-1">
+                    {expectedLine.sanMoves.map((san, index) => (
+                      <button
+                        key={`${san}-${index}`}
+                        className={`rounded-md border px-2 py-1 text-xs font-semibold transition-colors ${
+                          index < playedMoves.length
+                            ? "border-accent bg-[#e8f5f1] text-accent"
+                            : index === playedMoves.length
+                              ? "border-accent bg-white font-bold text-foreground ring-1 ring-accent"
+                              : "border-line bg-white text-muted"
+                        }`}
+                        onClick={() => jumpToPly(index + 1)}
+                        title={`Jump to move ${Math.floor(index / 2) + 1}`}
+                      >
+                        {index % 2 === 0 ? `${Math.floor(index / 2) + 1}.` : ""}{san}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted">
+                    {status === "scanning" ? "Scanning for moves…" : "No moves parsed yet. Scan will extract text automatically."}
+                  </p>
+                )}
+                {deviationPly ? (
+                  <p className="mt-2 text-sm text-bad">Deviated at ply {deviationPly} — engine is comparing your line against the book.</p>
+                ) : null}
                 {expectedLine?.parseErrors.length ? (
-                  <p className="mt-2 text-warn">Unparsed tokens: {expectedLine.parseErrors.join(", ")}</p>
+                  <p className="mt-2 text-xs text-warn">Unrecognised tokens: {expectedLine.parseErrors.join(", ")}</p>
                 ) : null}
               </div>
-              <div className="mt-3 rounded-md bg-background p-3 text-sm" data-testid="played-moves">
-                <p className="font-semibold">Played moves</p>
-                <p className="mt-1 leading-6">{playedMoves.length ? playedMoves.join(" ") : "No moves played yet."}</p>
-                {deviationPly ? <p className="mt-2 text-bad">Deviation on ply {deviationPly}. Engine analysis started.</p> : null}
-              </div>
+              {/* ── OCR text / manual corrections (collapsed) ── */}
+              <details className="mt-3">
+                <summary className="cursor-pointer rounded px-1 py-1 text-xs font-semibold text-muted hover:text-foreground">
+                  OCR text / manual correction
+                </summary>
+                <div className="mt-2">
+                  <textarea
+                    className="mb-2 min-h-28 w-full rounded-md border border-line bg-white p-3 text-sm"
+                    value={ocrTextDraft}
+                    onChange={(event) => setOcrTextDraft(event.target.value)}
+                    placeholder="Paste or correct OCR move text here, then click Re-parse."
+                  />
+                  <button className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white" onClick={reparseOcrDraft}>
+                    Re-parse moves
+                  </button>
+                </div>
+              </details>
             </div>
 
-            {engineEval || engineStatus !== "idle" ? (
-              <div className="rounded-md border border-line bg-panel p-4">
-                <h2 className="text-lg font-semibold">Analysis</h2>
-                <p className="text-sm text-muted">{engineStatus}</p>
-                <div className="mt-3 rounded-md bg-background p-3 text-sm">
-                  <p className="font-semibold">{evalText}</p>
-                  <p className="mt-1 text-muted">Best move: {engineEval?.bestMove ?? "none yet"}</p>
-                  <p className="mt-1 break-words text-muted">PV: {engineEval?.pv.join(" ") || "none yet"}</p>
-                </div>
+            <div className="rounded-md border border-line bg-panel p-4">
+              <h2 className="text-lg font-semibold">Analysis</h2>
+              <p className="text-sm text-muted">{engineStatus}</p>
+              <div className="mt-3 rounded-md bg-background p-3 text-sm">
+                <p className="font-semibold">{evalText}</p>
+                <p className="mt-1 text-muted">Best move: {engineEval?.bestMove ?? "none yet"}</p>
+                <p className="mt-1 break-words text-muted">PV: {engineEval?.pv.join(" ") || "none yet"}</p>
+                {bookEval ? <p className="mt-1 text-muted">Book line eval: {formatEval(bookEval)}</p> : null}
+                {evalDeltaCp !== undefined ? (
+                  <p className={`mt-1 font-semibold ${evalDeltaCp <= 0 ? "text-bad" : "text-accent"}`}>
+                    Deviation delta: {formatCpDelta(evalDeltaCp)}
+                  </p>
+                ) : null}
               </div>
-            ) : null}
+            </div>
 
             <div className="rounded-md border border-line bg-panel p-4">
               <h2 className="text-lg font-semibold">AI coach</h2>
@@ -913,8 +1285,12 @@ export function Chess2PdfApp() {
                   <div key={session.id} className="rounded-md border border-line bg-white p-3 text-sm">
                     <p className="font-semibold">{session.fileName}</p>
                     <p className="text-muted">
-                      {session.diagrams.length} diagram{session.diagrams.length === 1 ? "" : "s"}, {new Date(session.createdAt).toLocaleString()}
+                      {session.diagrams.length} board{session.diagrams.length === 1 ? "" : "s"}, {session.exercises.length} line{session.exercises.length === 1 ? "" : "s"}
                     </p>
+                    <p className="text-muted">{new Date(session.createdAt).toLocaleString()}</p>
+                    <button className="mt-2 rounded-md border border-line px-3 py-2 text-xs font-semibold" onClick={() => void restoreSession(session)}>
+                      Load
+                    </button>
                   </div>
                 ))}
                 {sessions.length === 0 ? <p className="rounded-md bg-background p-3 text-sm text-muted">No saved studies yet.</p> : null}
@@ -961,4 +1337,33 @@ function formatEval(evalResult?: EngineEval): string {
   }
   const pawns = ((evalResult.scoreCp ?? 0) / 100).toFixed(2);
   return `${Number(pawns) > 0 ? "+" : ""}${pawns} at depth ${evalResult.depth}`;
+}
+
+function formatCpDelta(deltaCp: number): string {
+  const pawns = (deltaCp / 100).toFixed(2);
+  return `${Number(pawns) > 0 ? "+" : ""}${pawns}`;
+}
+
+function cropPointFromEvent(event: PointerEvent<HTMLDivElement>, preview: PdfPagePreview): CropPoint {
+  const rect = event.currentTarget.getBoundingClientRect();
+  const x = ((event.clientX - rect.left) / rect.width) * preview.width;
+  const y = ((event.clientY - rect.top) / rect.height) * preview.height;
+  return {
+    x: Math.max(0, Math.min(preview.width, x)),
+    y: Math.max(0, Math.min(preview.height, y)),
+  };
+}
+
+function squareFromPoints(start: CropPoint, end: CropPoint, preview: PdfPagePreview): BBox {
+  const rawWidth = end.x - start.x;
+  const rawHeight = end.y - start.y;
+  const size = Math.max(1, Math.min(Math.abs(rawWidth), Math.abs(rawHeight)));
+  const x = rawWidth < 0 ? start.x - size : start.x;
+  const y = rawHeight < 0 ? start.y - size : start.y;
+  return {
+    x: Math.max(0, Math.min(preview.width - size, x)),
+    y: Math.max(0, Math.min(preview.height - size, y)),
+    width: size,
+    height: size,
+  };
 }

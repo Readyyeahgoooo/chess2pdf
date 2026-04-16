@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Chess2pdf",
-  description: "Free browser-only chess PDF reader with local exercises and engine analysis.",
+  description: "Chess PDF study board.",
 };
 
 export default function RootLayout({

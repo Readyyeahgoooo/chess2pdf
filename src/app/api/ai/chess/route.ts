@@ -1,13 +1,29 @@
 import { NextResponse } from "next/server";
-import { aiModeTitle, buildChessAiMessages, type ChessAiRequest } from "@/lib/ai-chess";
+import { DEFAULT_OPENROUTER_MODEL, aiModeTitle, buildChessAiMessages, sanitizeChessAiRequest, type ChessAiRequest } from "@/lib/ai-chess";
 
 export const runtime = "nodejs";
+
+const MAX_BODY_BYTES = 16 * 1024;
+const REQUEST_TIMEOUT_MS = 18_000;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX_PER_WINDOW = 6;
+const RATE_LIMIT_DAY_MS = 24 * 60 * 60 * 1000;
+const RATE_LIMIT_MAX_PER_DAY = 40;
 
 type OpenRouterChoice = {
   message?: {
     content?: string;
   };
 };
+
+type RateLimitBucket = {
+  minuteStart: number;
+  minuteCount: number;
+  dayStart: number;
+  dayCount: number;
+};
+
+const rateLimitBuckets = new Map<string, RateLimitBucket>();
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -23,6 +39,33 @@ export async function POST(request: Request) {
     );
   }
 
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (contentLength > MAX_BODY_BYTES) {
+    return NextResponse.json(
+      {
+        ok: false,
+        configured: true,
+        title: "Request too large",
+        explanation: "AI coach requests are limited to derived chess data only.",
+      },
+      { status: 413 },
+    );
+  }
+
+  const ip = clientIp(request);
+  const limited = checkRateLimit(ip);
+  if (limited) {
+    return NextResponse.json(
+      {
+        ok: false,
+        configured: true,
+        title: "AI rate limit reached",
+        explanation: limited,
+      },
+      { status: 429 },
+    );
+  }
+
   let body: ChessAiRequest;
   try {
     body = (await request.json()) as ChessAiRequest;
@@ -34,8 +77,11 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: false, configured: true, title: "Bad request", explanation: "Missing chess context." }, { status: 400 });
   }
 
-  const model = process.env.OPENROUTER_MODEL || "openrouter/auto";
+  const safeBody = sanitizeChessAiRequest(body);
+  const model = process.env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL;
   const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || process.env.VERCEL_PROJECT_PRODUCTION_URL || "https://chess2pdf.vercel.app";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -48,10 +94,11 @@ export async function POST(request: Request) {
       },
       body: JSON.stringify({
         model,
-        messages: buildChessAiMessages(body),
+        messages: buildChessAiMessages(safeBody),
         temperature: 0.35,
-        max_tokens: 500,
+        max_tokens: 450,
       }),
+      signal: controller.signal,
     });
 
     const payload = (await response.json()) as { choices?: OpenRouterChoice[]; error?: { message?: string } };
@@ -81,6 +128,8 @@ export async function POST(request: Request) {
       },
       { status: 500 },
     );
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -92,4 +141,43 @@ function isValidBody(body: ChessAiRequest) {
     Array.isArray(body.recognizedMoves) &&
     Array.isArray(body.playedMoves)
   );
+}
+
+function clientIp(request: Request) {
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  if (forwardedFor) {
+    return forwardedFor.split(",")[0]?.trim() || "unknown";
+  }
+  return request.headers.get("x-real-ip") || "unknown";
+}
+
+function checkRateLimit(ip: string) {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(ip) ?? {
+    minuteStart: now,
+    minuteCount: 0,
+    dayStart: now,
+    dayCount: 0,
+  };
+
+  if (now - bucket.minuteStart > RATE_LIMIT_WINDOW_MS) {
+    bucket.minuteStart = now;
+    bucket.minuteCount = 0;
+  }
+  if (now - bucket.dayStart > RATE_LIMIT_DAY_MS) {
+    bucket.dayStart = now;
+    bucket.dayCount = 0;
+  }
+
+  bucket.minuteCount += 1;
+  bucket.dayCount += 1;
+  rateLimitBuckets.set(ip, bucket);
+
+  if (bucket.minuteCount > RATE_LIMIT_MAX_PER_WINDOW) {
+    return "Please wait a minute before asking the AI coach again.";
+  }
+  if (bucket.dayCount > RATE_LIMIT_MAX_PER_DAY) {
+    return "Daily AI coach limit reached for this connection.";
+  }
+  return "";
 }

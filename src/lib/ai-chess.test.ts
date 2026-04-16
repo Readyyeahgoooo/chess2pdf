@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { buildChessAiMessages } from "@/lib/ai-chess";
+import { DEFAULT_OPENROUTER_MODEL, buildChessAiMessages, sanitizeChessAiRequest } from "@/lib/ai-chess";
 import { STARTING_FEN } from "@/lib/constants";
 
 describe("buildChessAiMessages", () => {
+  it("defaults to the requested free OpenRouter model", () => {
+    expect(DEFAULT_OPENROUTER_MODEL).toBe("nvidia/nemotron-3-super-120b-a12b:free");
+  });
+
   it("builds a summary prompt from derived chess data", () => {
     const messages = buildChessAiMessages({
       mode: "line-summary",
@@ -36,5 +40,20 @@ describe("buildChessAiMessages", () => {
 
     expect(messages[1].content).toContain("Explain why");
     expect(messages[1].content).toContain("-55 centipawns");
+  });
+
+  it("clips oversized OCR and move payloads before prompting", () => {
+    const request = sanitizeChessAiRequest({
+      mode: "line-summary",
+      startingFen: `${STARTING_FEN}${"x".repeat(300)}`,
+      currentFen: STARTING_FEN,
+      recognizedMoves: Array.from({ length: 200 }, (_, index) => `e${index}`),
+      playedMoves: [],
+      rawText: "a".repeat(10_000),
+    });
+
+    expect(request.startingFen.length).toBeLessThanOrEqual(120);
+    expect(request.recognizedMoves).toHaveLength(80);
+    expect(request.rawText).toHaveLength(1200);
   });
 });

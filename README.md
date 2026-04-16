@@ -12,7 +12,7 @@
 - **Local Stockfish analysis** — Stockfish 18 lite WASM runs in a Web Worker; no server call
 - **Edit mode** — place/remove individual pieces to correct any recognised position
 - **FEN / PGN clipboard** — copy the current FEN or the parsed PGN; open Lichess in one click
-- **IndexedDB sessions** — recognised FENs and move lines are stored locally; original PDFs are not saved
+- **Your history** — store up to 10 recognised studies locally
 - **No account, no upload route, no telemetry**
 - **Optional AI coach** — with `OPENROUTER_API_KEY`, summarize book lines and explain deviations using derived chess data only
 
@@ -38,11 +38,13 @@ To enable AI explanations on Vercel, add:
 
 ```bash
 OPENROUTER_API_KEY=...
-OPENROUTER_MODEL=openrouter/auto
+OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free
 NEXT_PUBLIC_SITE_URL=https://chess2pdf.vercel.app
 ```
 
 The browser calls `/api/ai/chess`; the server route calls OpenRouter with FEN, recognized moves, played moves, and Stockfish output. It does not send original PDF bytes.
+
+The AI route keeps the OpenRouter key server-only, rejects bodies over 16 KB, clips OCR/move context before prompting, uses an 18 second upstream timeout, and applies a small per-IP in-memory throttle. For stronger production abuse protection, also set an OpenRouter spend limit and use Vercel Firewall or a durable rate limiter such as Upstash.
 
 ## Getting Started
 
@@ -75,7 +77,7 @@ src/
     stockfish.ts        Stockfish WASM worker wrapper
     fen-editor.ts       FEN manipulation helpers
     file-validation.ts  PDF signature & size check
-    storage.ts          IndexedDB session persistence
+    storage.ts          local history persistence, capped at 10 studies
     constants.ts        App-wide constants
     types.ts            Shared TypeScript types
 public/

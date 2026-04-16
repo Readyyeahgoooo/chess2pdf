@@ -11,6 +11,7 @@ interface Chess2PdfDb extends DBSchema {
 
 const DB_NAME = "chess2pdf";
 const DB_VERSION = 1;
+const MAX_STUDIES = 10;
 
 async function getDb() {
   return openDB<Chess2PdfDb>(DB_NAME, DB_VERSION, {
@@ -24,12 +25,14 @@ async function getDb() {
 export async function saveSession(session: PdfSession): Promise<void> {
   const db = await getDb();
   await db.put("sessions", session);
+  const sessions = await listSessions();
+  await Promise.all(sessions.slice(MAX_STUDIES).map((oldSession) => db.delete("sessions", oldSession.id)));
 }
 
 export async function listSessions(): Promise<PdfSession[]> {
   const db = await getDb();
   const sessions = await db.getAllFromIndex("sessions", "by-created");
-  return sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return sessions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, MAX_STUDIES);
 }
 
 export async function deleteSession(id: string): Promise<void> {

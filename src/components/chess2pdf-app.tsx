@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
-import { DEFAULT_DEPTH, DEMO_LINE, OCR_CONCURRENCY, SAMPLE_FENS, STARTING_FEN } from "@/lib/constants";
+import { DEFAULT_DEPTH, OCR_CONCURRENCY, SAMPLE_FENS, STARTING_FEN } from "@/lib/constants";
 import { clearFen, isSquare, isValidFen, movePieceInFen, placePieceInFen, safeFen } from "@/lib/fen-editor";
 import { validatePdfFile } from "@/lib/file-validation";
 import { lineToPgn, parseRecognizedLine } from "@/lib/move-parser";
@@ -36,49 +36,28 @@ const PIECE_LABEL: Record<PieceCode, string> = {
 
 type BoardOrientation = "white" | "black";
 
-const DEMO_DIAGRAM_ID = "demo-diagram";
-const DEMO_PARSED_LINE = parseRecognizedLine(DEMO_LINE, STARTING_FEN);
-const DEMO_DIAGRAM: DetectedDiagram = {
-  id: DEMO_DIAGRAM_ID,
-  pageIndex: 0,
-  bbox: { x: 0, y: 0, width: 0, height: 0 },
-  fen: STARTING_FEN,
-  confidence: 1,
-  orientation: "white",
-  notes: ["Demo line loaded. Upload a chess PDF to run local recognition."],
-};
-const DEMO_RECOGNIZED_LINE: RecognizedLine = {
-  id: "demo-line",
-  diagramId: DEMO_DIAGRAM_ID,
-  rawText: DEMO_LINE,
-  normalizedText: DEMO_PARSED_LINE.normalizedText,
-  sanMoves: DEMO_PARSED_LINE.sanMoves,
-  confidence: DEMO_PARSED_LINE.confidence,
-  parseErrors: DEMO_PARSED_LINE.parseErrors,
-};
-
 export function Chess2PdfApp() {
   const [status, setStatus] = useState<ScanStatus>("ready");
   const [error, setError] = useState("");
-  const [progress, setProgress] = useState("Demo ready. PDFs stay in this browser when you open one.");
+  const [progress, setProgress] = useState("Open a PDF to begin.");
   const [hasPdfLoaded, setHasPdfLoaded] = useState(false);
   const [fileMeta, setFileMeta] = useState<{ name: string; size: number } | null>(null);
   const [pages, setPages] = useState<PdfPagePreview[]>([]);
   const [currentPage, setCurrentPage] = useState(0);
-  const [diagrams, setDiagrams] = useState<DetectedDiagram[]>([DEMO_DIAGRAM]);
-  const [lines, setLines] = useState<RecognizedLine[]>([DEMO_RECOGNIZED_LINE]);
-  const [selectedDiagramId, setSelectedDiagramId] = useState<string | null>(DEMO_DIAGRAM_ID);
+  const [diagrams, setDiagrams] = useState<DetectedDiagram[]>([]);
+  const [lines, setLines] = useState<RecognizedLine[]>([]);
+  const [selectedDiagramId, setSelectedDiagramId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PdfSession[]>([]);
   const [fen, setFen] = useState(STARTING_FEN);
   const [fenDraft, setFenDraft] = useState(STARTING_FEN);
   const [playedMoves, setPlayedMoves] = useState<string[]>([]);
   const [deviationPly, setDeviationPly] = useState<number | undefined>();
   const [engineEval, setEngineEval] = useState<EngineEval | undefined>();
-  const [engineStatus, setEngineStatus] = useState("Engine idle");
+  const [engineStatus, setEngineStatus] = useState("idle");
   const [orientation, setOrientation] = useState<BoardOrientation>("white");
   const [editMode, setEditMode] = useState(false);
   const [selectedPiece, setSelectedPiece] = useState<PieceCode | null>("wQ");
-  const [ocrTextDraft, setOcrTextDraft] = useState(DEMO_LINE);
+  const [ocrTextDraft, setOcrTextDraft] = useState("");
   const [aiStatus, setAiStatus] = useState("AI coach idle");
   const [aiResult, setAiResult] = useState<ChessAiResponse | null>(null);
 
@@ -105,47 +84,12 @@ export function Chess2PdfApp() {
     setPlayedMoves([]);
     setDeviationPly(undefined);
     setEngineEval(undefined);
-    setEngineStatus("Engine idle");
+    setEngineStatus("idle");
   }, []);
 
   const refreshSessions = useCallback(async () => {
     setSessions(await listSessions());
   }, []);
-
-  const loadDemo = useCallback(() => {
-    const diagramId = "demo-diagram";
-    const parsed = parseRecognizedLine(DEMO_LINE, STARTING_FEN);
-    const demoLine: RecognizedLine = {
-      id: "demo-line",
-      diagramId,
-      rawText: DEMO_LINE,
-      normalizedText: parsed.normalizedText,
-      sanMoves: parsed.sanMoves,
-      confidence: parsed.confidence,
-      parseErrors: parsed.parseErrors,
-    };
-    setFileMeta(null);
-    setHasPdfLoaded(false);
-    setPages([]);
-    setCurrentPage(0);
-    setDiagrams([
-      {
-        id: diagramId,
-        pageIndex: 0,
-        bbox: { x: 0, y: 0, width: 0, height: 0 },
-        fen: STARTING_FEN,
-        confidence: 1,
-        orientation: "white",
-        notes: ["Demo line loaded. Upload a chess PDF to run local recognition."],
-      },
-    ]);
-    setLines([demoLine]);
-    setSelectedDiagramId(diagramId);
-    resetBoard(STARTING_FEN);
-    setOcrTextDraft(DEMO_LINE);
-    setProgress("Demo ready. PDFs stay in this browser when you open one.");
-    setStatus("ready");
-  }, [resetBoard]);
 
   useEffect(() => {
     stockfishRef.current = new StockfishClient();
@@ -427,7 +371,7 @@ export function Chess2PdfApp() {
       const result = await stockfishRef.current?.evaluate(targetFen, DEFAULT_DEPTH);
       if (result) {
         setEngineEval(result);
-        setEngineStatus("Local engine ready");
+        setEngineStatus("Analysis ready");
       }
     } catch (analysisError) {
       setEngineStatus(analysisError instanceof Error ? analysisError.message : "Engine failed");
@@ -481,7 +425,7 @@ export function Chess2PdfApp() {
   async function wipeLocalData() {
     await clearLocalData();
     await refreshSessions();
-    setProgress("Local IndexedDB sessions cleared.");
+    setProgress("History cleared.");
   }
 
   const currentPreview = pages.find((page) => page.pageIndex === currentPage);
@@ -494,11 +438,7 @@ export function Chess2PdfApp() {
       <div className="mx-auto flex min-h-screen w-full max-w-[1700px] flex-col gap-4 px-4 py-4">
         <header className="grid gap-3 border-b border-line pb-4 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
-            <p className="text-sm font-semibold text-accent">Free browser-only chess PDF reader</p>
             <h1 className="text-3xl font-semibold">Chess2pdf</h1>
-            <p className="max-w-3xl text-sm leading-6 text-muted">
-              Open a chess PDF, detect diagrams, correct the position when needed, and study with a local board and Stockfish. No account. No upload route. PDF bytes stay in this browser.
-            </p>
           </div>
           <div className="flex flex-wrap gap-2 text-sm">
             <label className="cursor-pointer rounded-md bg-accent px-4 py-2 font-semibold text-white hover:bg-accent-strong">
@@ -515,11 +455,8 @@ export function Chess2PdfApp() {
                 }}
               />
             </label>
-            <button className="rounded-md border border-line bg-panel px-4 py-2 font-semibold" onClick={loadDemo}>
-              Demo line
-            </button>
             <button className="rounded-md border border-line bg-panel px-4 py-2 font-semibold" onClick={wipeLocalData}>
-              Clear local data
+              Clear history
             </button>
           </div>
         </header>
@@ -530,7 +467,7 @@ export function Chess2PdfApp() {
           <aside className="min-h-[520px] rounded-md border border-line bg-panel">
             <div className="border-b border-line p-4">
               <h2 className="text-lg font-semibold">PDF pages</h2>
-              <p className="text-sm text-muted">{fileMeta ? `${fileMeta.name} (${formatBytes(fileMeta.size)})` : "Demo mode, no PDF loaded."}</p>
+              {fileMeta ? <p className="text-sm text-muted">{`${fileMeta.name} (${formatBytes(fileMeta.size)})`}</p> : null}
             </div>
             <div
               className="m-4 rounded-md border border-dashed border-line p-4 text-sm text-muted"
@@ -703,7 +640,11 @@ export function Chess2PdfApp() {
                     ))}
                   </select>
                   <div className="mt-2 flex flex-wrap gap-2">
-                    <button className="rounded-md border border-line px-3 py-2 text-sm font-semibold" onClick={playExpectedMove}>
+                    <button
+                      className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={!expectedLine?.sanMoves.length}
+                      onClick={playExpectedMove}
+                    >
                       Play next book move
                     </button>
                     <button className="rounded-md border border-line px-3 py-2 text-sm font-semibold" onClick={undoMove}>
@@ -808,15 +749,17 @@ export function Chess2PdfApp() {
               </div>
             </div>
 
-            <div className="rounded-md border border-line bg-panel p-4">
-              <h2 className="text-lg font-semibold">Local engine</h2>
-              <p className="text-sm text-muted">{engineStatus}</p>
-              <div className="mt-3 rounded-md bg-background p-3 text-sm">
-                <p className="font-semibold">{evalText}</p>
-                <p className="mt-1 text-muted">Best move: {engineEval?.bestMove ?? "none yet"}</p>
-                <p className="mt-1 break-words text-muted">PV: {engineEval?.pv.join(" ") || "none yet"}</p>
+            {engineEval || engineStatus !== "idle" ? (
+              <div className="rounded-md border border-line bg-panel p-4">
+                <h2 className="text-lg font-semibold">Analysis</h2>
+                <p className="text-sm text-muted">{engineStatus}</p>
+                <div className="mt-3 rounded-md bg-background p-3 text-sm">
+                  <p className="font-semibold">{evalText}</p>
+                  <p className="mt-1 text-muted">Best move: {engineEval?.bestMove ?? "none yet"}</p>
+                  <p className="mt-1 break-words text-muted">PV: {engineEval?.pv.join(" ") || "none yet"}</p>
+                </div>
               </div>
-            </div>
+            ) : null}
 
             <div className="rounded-md border border-line bg-panel p-4">
               <h2 className="text-lg font-semibold">AI coach</h2>
@@ -852,10 +795,9 @@ export function Chess2PdfApp() {
             </div>
 
             <div className="rounded-md border border-line bg-panel p-4">
-              <h2 className="text-lg font-semibold">Local sessions</h2>
-              <p className="mb-3 text-sm text-muted">IndexedDB keeps derived data only. Original PDFs are not saved by default.</p>
+              <h2 className="text-lg font-semibold">Your history</h2>
               <div className="space-y-2">
-                {sessions.slice(0, 5).map((session) => (
+                {sessions.slice(0, 10).map((session) => (
                   <div key={session.id} className="rounded-md border border-line bg-white p-3 text-sm">
                     <p className="font-semibold">{session.fileName}</p>
                     <p className="text-muted">
@@ -863,7 +805,7 @@ export function Chess2PdfApp() {
                     </p>
                   </div>
                 ))}
-                {sessions.length === 0 ? <p className="rounded-md bg-background p-3 text-sm text-muted">No saved local sessions yet.</p> : null}
+                {sessions.length === 0 ? <p className="rounded-md bg-background p-3 text-sm text-muted">No saved studies yet.</p> : null}
               </div>
             </div>
           </aside>
@@ -900,7 +842,7 @@ function formatBytes(bytes: number): string {
 
 function formatEval(evalResult?: EngineEval): string {
   if (!evalResult) {
-    return "No evaluation yet";
+    return "Waiting for result";
   }
   if (evalResult.mateIn !== undefined) {
     return `Mate ${evalResult.mateIn > 0 ? "+" : ""}${evalResult.mateIn} at depth ${evalResult.depth}`;

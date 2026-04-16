@@ -7,7 +7,7 @@ const nextConfig: NextConfig = {
   async headers() {
     const connectSrc = isDev
       ? "connect-src 'self' blob: data: ws: http://localhost:3000 http://127.0.0.1:3000"
-      : "connect-src 'self' blob: data:";
+      : "connect-src 'self' blob: data: https://cdn.jsdelivr.net";
 
     const csp = [
       "default-src 'self'",
@@ -18,7 +18,7 @@ const nextConfig: NextConfig = {
       "font-src 'self'",
       "style-src 'self' 'unsafe-inline'",
       "script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:",
-      "worker-src 'self' blob:",
+      "worker-src 'self' blob: https://cdn.jsdelivr.net",
       connectSrc,
     ].join("; ");
 

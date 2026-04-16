@@ -42,3 +42,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Fenify ONNX model (large binary — generate with scripts/convert_fenify_to_onnx.py)
+/public/fenify/
+/scripts/fenify_cpu.pt

@@ -6,7 +6,7 @@ test("loads the browser-only chess workspace", async ({ page }) => {
 
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Chess2pdf" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Play next book move" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next →" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Your history" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Demo line" })).toHaveCount(0);
   await expect(page.getByText("Free browser-only chess PDF reader")).toHaveCount(0);

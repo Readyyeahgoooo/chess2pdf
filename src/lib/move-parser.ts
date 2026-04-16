@@ -23,6 +23,8 @@ export function normalizeChessText(rawText: string): string {
     .replace(/[–—]/g, "-")
     .replace(/\b0-0-0\b/g, "O-O-O")
     .replace(/\b0-0\b/g, "O-O")
+    .replace(/[?!]+/g, " ")
+    .replace(/[,:;]+/g, " ")
     .replace(RESULT_PATTERN, " ")
     .replace(MOVE_NUMBER_PATTERN, " ")
     .replace(NOISE_PATTERN, " ")

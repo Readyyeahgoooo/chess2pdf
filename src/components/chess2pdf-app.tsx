@@ -20,8 +20,8 @@ import { StockfishClient } from "@/lib/stockfish";
 import type { ChessAiMode, ChessAiResponse } from "@/lib/ai-chess";
 import type { BBox, DetectedDiagram, EngineEval, PdfPagePreview, PdfSession, PieceCode, RecognizedLine, ScanStatus } from "@/lib/types";
 
-// Always auto-apply detected boards; STARTING_FEN is the fallback so it is always legal.
-const AUTO_APPLY_CONFIDENCE = 0;
+const AUTO_APPLY_CONFIDENCE = 0.55;
+const UNRECOGNIZED_FEN = "4k3/8/8/8/8/8/8/4K3 w - - 0 1";
 
 const PIECES: PieceCode[] = ["wK", "wQ", "wR", "wB", "wN", "wP", "bK", "bQ", "bR", "bB", "bN", "bP"];
 const PIECE_LABEL: Record<PieceCode, string> = {
@@ -59,8 +59,8 @@ export function Chess2PdfApp() {
   const [selectedDiagramId, setSelectedDiagramId] = useState<string | null>(null);
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PdfSession[]>([]);
-  const [fen, setFen] = useState(STARTING_FEN);
-  const [fenDraft, setFenDraft] = useState(STARTING_FEN);
+  const [fen, setFen] = useState(UNRECOGNIZED_FEN);
+  const [fenDraft, setFenDraft] = useState(UNRECOGNIZED_FEN);
   const [playedMoves, setPlayedMoves] = useState<string[]>([]);
   const [deviationPly, setDeviationPly] = useState<number | undefined>();
   const [engineEval, setEngineEval] = useState<EngineEval | undefined>();
@@ -105,7 +105,7 @@ export function Chess2PdfApp() {
     }
   }, [fen]);
 
-  const resetBoard = useCallback((nextFen = STARTING_FEN) => {
+  const resetBoard = useCallback((nextFen = UNRECOGNIZED_FEN) => {
     const resolved = safeFen(nextFen);
     setFen(resolved);
     setFenDraft(resolved);
@@ -172,6 +172,10 @@ export function Chess2PdfApp() {
       setLines([]);
       setSelectedDiagramId(null);
       setSelectedLineId(null);
+      setFen(UNRECOGNIZED_FEN);
+      setFenDraft(UNRECOGNIZED_FEN);
+      setPlayedMoves([]);
+      setDeviationPly(undefined);
       setCropMode(false);
       setCropStart(null);
       setCropBox(null);
@@ -359,6 +363,7 @@ export function Chess2PdfApp() {
     options: { auto?: boolean; navigate?: boolean } = {},
   ) {
     const shouldNavigatePage = options.navigate ?? true;
+    const shouldApplyBoard = !options.auto || diagram.confidence >= AUTO_APPLY_CONFIDENCE;
     setSelectedDiagramId(diagram.id);
     if (shouldNavigatePage && diagram.pageIndex !== currentPage) {
       setCurrentPage(diagram.pageIndex);
@@ -366,8 +371,21 @@ export function Chess2PdfApp() {
     const line = sourceLines.find((item) => item.diagramId === diagram.id);
     setSelectedLineId(line?.id ?? null);
     setOcrTextDraft(line?.rawText || "");
+    if (!shouldApplyBoard) {
+      const moveCount = line?.sanMoves.length ?? 0;
+      setEngineEval(undefined);
+      setBookEval(undefined);
+      setEvalDeltaCp(undefined);
+      setEngineStatus("Engine idle");
+      setProgress(
+        moveCount > 0
+          ? `Low-confidence board selected. ${moveCount} move${moveCount === 1 ? "" : "s"} detected, but the position was not auto-applied.`
+          : "Low-confidence board selected. Use Crop board, Edit mode, or FEN correction before analysis.",
+      );
+      return;
+    }
     resetBoard(diagram.fen);
-    if (diagram.confidence < 0.45) {
+    if (diagram.confidence < AUTO_APPLY_CONFIDENCE) {
       const moveCount = line?.sanMoves.length ?? 0;
       setProgress(
         moveCount > 0
@@ -661,6 +679,18 @@ export function Chess2PdfApp() {
     void scanPages(indices);
   }
 
+  function scanNextRange() {
+    if (!totalPages) {
+      return;
+    }
+    const nextStart = Math.min(totalPages, Math.max(scanRangeEnd + 1, 1));
+    const nextEnd = Math.min(totalPages, nextStart + 19);
+    setScanRangeStart(nextStart);
+    setScanRangeEnd(nextEnd);
+    const indices = Array.from({ length: nextEnd - nextStart + 1 }, (_, offset) => nextStart - 1 + offset);
+    void scanPages(indices);
+  }
+
   async function scanManualCrop() {
     const document = pdfRef.current;
     if (!document || !cropBox) {
@@ -828,7 +858,7 @@ export function Chess2PdfApp() {
                 Cancel
               </button>
             </div>
-            <div className="grid grid-cols-[1fr_1fr_auto] gap-2 px-4 pb-3">
+            <div className="grid grid-cols-[1fr_1fr_auto_auto] gap-2 px-4 pb-3">
               <label className="text-xs font-semibold text-muted">
                 From
                 <input
@@ -858,7 +888,14 @@ export function Chess2PdfApp() {
               >
                 Scan range
               </button>
-              <p className="col-span-3 text-xs text-muted">Estimate: about 8 seconds per page on typical scans.</p>
+              <button
+                className="self-end rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!hasPdfLoaded || status === "scanning" || scanRangeEnd >= totalPages}
+                onClick={scanNextRange}
+              >
+                Next 20
+              </button>
+              <p className="col-span-4 text-xs text-muted">Estimate: about 8 seconds per page on typical scans.</p>
             </div>
             <div className="max-h-[58vh] overflow-auto px-4 pb-4">
               {totalPages === 0 ? (

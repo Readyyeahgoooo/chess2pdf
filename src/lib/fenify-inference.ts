@@ -83,11 +83,12 @@ export async function loadFenifyModel(): Promise<OrtSession | null> {
     try {
       const ort = await import("onnxruntime-web");
 
-      // Point WASM runtime at the CDN so we don't need to copy files into /public
-      // (override with NEXT_PUBLIC_ORT_WASM_PATH if you self-host the WASM assets)
+      // Self-host the ORT WASM runtime so the strict CSP can keep all inference
+      // assets on this origin. Override only if you intentionally host the
+      // runtime elsewhere.
       const wasmBase =
         process.env.NEXT_PUBLIC_ORT_WASM_PATH ??
-        `https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/`;
+        "/ort/";
       ort.env.wasm.wasmPaths = wasmBase;
 
       const modelUrl =

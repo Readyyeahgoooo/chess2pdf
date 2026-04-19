@@ -45,5 +45,6 @@ next-env.d.ts
 
 # Fenify ONNX model (large binary — generate with scripts/convert_fenify_to_onnx.py)
 /public/fenify/
+/public/ort/
 /scripts/fenify_cpu.pt
 .venv/

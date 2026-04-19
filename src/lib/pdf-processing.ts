@@ -5,6 +5,13 @@ import type { BBox, DetectedDiagram, PdfPagePreview, RecognizedLine } from "@/li
 
 type PdfJs = typeof import("pdfjs-dist");
 export type PdfDocument = Awaited<ReturnType<PdfJs["getDocument"]>["promise"]>;
+type BoardClassification = {
+  fen: string;
+  bbox?: BBox;
+  confidence: number;
+  notes: string[];
+  source: "fenify" | "template" | "occupancy" | "fallback";
+};
 
 const TEMPLATE_SIZE = 48;
 const TEMPLATE_PIECES = [
@@ -54,7 +61,7 @@ export async function loadPdfDocument(file: File): Promise<PdfDocument> {
   return document;
 }
 
-export async function renderPdfPage(document: PdfDocument, pageIndex: number, scale = 1.45): Promise<RenderedPage> {
+export async function renderPdfPage(document: PdfDocument, pageIndex: number, scale = 2.35): Promise<RenderedPage> {
   const page = await document.getPage(pageIndex + 1);
   const viewport = page.getViewport({ scale });
   const canvas = window.document.createElement("canvas");
@@ -102,7 +109,12 @@ export function detectBoardCandidates(canvas: HTMLCanvasElement): Array<BBox & {
     }
   }
 
-  return nonOverlapping(candidates.sort((a, b) => b.confidence - a.confidence)).slice(0, 8);
+  const refined = nonOverlapping(candidates.sort((a, b) => b.confidence - a.confidence))
+    .slice(0, 12)
+    .map((candidate) => refineBoardCandidate(context, candidate))
+    .sort((a, b) => b.confidence - a.confidence);
+
+  return nonOverlapping(refined).slice(0, 8);
 }
 
 /**
@@ -116,18 +128,27 @@ if (typeof window !== "undefined") {
 export async function classifyBoardFen(
   canvas: HTMLCanvasElement,
   bbox: BBox
-): Promise<{ fen: string; confidence: number; notes: string[] }> {
+): Promise<BoardClassification> {
   // ── 1. Fenify ML model (highest accuracy, requires public/fenify/model.onnx) ──
-  const fenifyResult = await classifyWithFenify(canvas, bbox);
-  if (fenifyResult) {
+  const fenifyResult = await classifyFenifyVariants(canvas, bbox);
+  if (fenifyResult?.valid) {
     return {
       fen: fenifyResult.fen,
+      bbox: fenifyResult.bbox,
       confidence: fenifyResult.confidence,
+      source: "fenify",
       notes: [
         "Position recognised by the Fenify neural network (99.8% per-square accuracy on book diagrams).",
         "Verify side-to-move and castling rights before deep analysis.",
       ],
     };
+  }
+
+  if (fenifyResult) {
+    return lowConfidenceFen([
+      "Fenify ran, but the crop did not produce a legal chess position with one white king and one black king.",
+      "Use Crop board to select only the 8x8 board, excluding coordinate labels and nearby text.",
+    ]);
   }
 
   // ── 2. Heuristic fallbacks (no model file present) ────────────────────────
@@ -145,6 +166,7 @@ export async function classifyBoardFen(
     return {
       fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       confidence: 0.68,
+      source: "template",
       notes: ["The board resembles a starting position. Confirm before serious study."],
     };
   }
@@ -162,6 +184,7 @@ export async function classifyBoardFen(
     return {
       fen: occupancyFen,
       confidence: 0.32,
+      source: "occupancy",
       notes: [
         "Piece types estimated from ink density — squares with pieces are shown but piece identity needs correction.",
         "Run  scripts/convert_fenify_to_onnx.py  to enable the Fenify ML classifier for accurate piece identification.",
@@ -229,11 +252,11 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
     const diagram: DetectedDiagram = {
       id: crypto.randomUUID(),
       pageIndex: page.pageIndex,
-      bbox: candidate,
+      bbox: classification.bbox ?? candidate,
       fen: classification.fen,
-      confidence: Math.min(candidate.confidence, classification.confidence),
+      confidence: combineDiagramConfidence(candidate.confidence, classification),
       orientation: "white",
-      sourceCropUrl: cropToDataUrl(page.canvas, candidate),
+      sourceCropUrl: cropToDataUrl(page.canvas, classification.bbox ?? candidate),
       notes: classification.notes,
     };
     diagrams.push(diagram);
@@ -315,8 +338,388 @@ function lowConfidenceFen(notes: string[]) {
   return {
     fen: "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
     confidence: 0.28,
+    source: "fallback" as const,
     notes,
   };
+}
+
+async function classifyFenifyVariants(canvas: HTMLCanvasElement, bbox: BBox) {
+  let best:
+    | {
+        fen: string;
+        bbox: BBox;
+        confidence: number;
+        valid: boolean;
+        structureScore: number;
+        score: number;
+      }
+    | null = null;
+
+  for (const probeBox of fenifyProbeBoxes(canvas, bbox)) {
+    const result = await classifyWithFenify(canvas, probeBox);
+    if (!result) {
+      return null;
+    }
+
+    const structureScore = scoreFenStructure(result.fen);
+    const valid = structureScore >= 0.74;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    const visualScore = context ? scoreBoardCandidate(context, probeBox.x, probeBox.y, probeBox.width) : 0;
+    const candidate = {
+      fen: result.fen,
+      bbox: probeBox,
+      confidence: Math.max(0.5, result.confidence * 0.8 + structureScore * 0.2),
+      valid,
+      structureScore,
+      score: structureScore * 0.55 + result.confidence * 0.25 + visualScore * 0.2,
+    };
+
+    if (
+      !best ||
+      Number(candidate.valid) > Number(best.valid) ||
+      candidate.score > best.score
+    ) {
+      best = candidate;
+    }
+  }
+
+  return best;
+}
+
+function fenifyProbeBoxes(canvas: HTMLCanvasElement, bbox: BBox): BBox[] {
+  const probes: BBox[] = [];
+  const borderBox = tightenBoardByBorder(canvas, bbox);
+  const densityBox = tightenBoardByDensity(canvas, bbox);
+  if (borderBox) {
+    probes.push(borderBox);
+  }
+  probes.push(...bookDiagramInnerBoxes(canvas, densityBox ?? bbox));
+  const bases = densityBox ? [densityBox, bbox] : [bbox];
+  const scales = [1, 0.88];
+  const shifts = [
+    [0, 0],
+    [-0.03, 0],
+    [0.03, 0],
+  ] as const;
+
+  for (const base of bases) {
+    const centerX = base.x + base.width / 2;
+    const centerY = base.y + base.height / 2;
+
+    for (const scale of scales) {
+      const size = Math.max(48, Math.min(canvas.width, canvas.height, base.width * scale));
+      for (const [shiftX, shiftY] of shifts) {
+        probes.push(
+          clampSquareBox(
+            {
+              x: centerX - size / 2 + base.width * shiftX,
+              y: centerY - size / 2 + base.height * shiftY,
+              width: size,
+              height: size,
+            },
+            canvas.width,
+            canvas.height,
+          ),
+        );
+      }
+    }
+  }
+
+  return dedupeBoxes(probes);
+}
+
+function bookDiagramInnerBoxes(canvas: HTMLCanvasElement, bbox: BBox): BBox[] {
+  return [
+    { x: bbox.x + bbox.width * 0.25, y: bbox.y + bbox.height * 0.1, width: bbox.width * 0.68, height: bbox.width * 0.68 },
+    { x: bbox.x + bbox.width * 0.22, y: bbox.y + bbox.height * 0.1, width: bbox.width * 0.7, height: bbox.width * 0.7 },
+    { x: bbox.x + bbox.width * 0.18, y: bbox.y + bbox.height * 0.1, width: bbox.width * 0.72, height: bbox.width * 0.72 },
+    { x: bbox.x + bbox.width * 0.16, y: bbox.y + bbox.height * 0.08, width: bbox.width * 0.76, height: bbox.width * 0.76 },
+  ].map((box) => clampSquareBox(box, canvas.width, canvas.height));
+}
+
+function tightenBoardByBorder(canvas: HTMLCanvasElement, bbox: BBox): BBox | null {
+  const sampleSize = 240;
+  const sample = window.document.createElement("canvas");
+  sample.width = sampleSize;
+  sample.height = sampleSize;
+  const sampleContext = sample.getContext("2d", { willReadFrequently: true });
+  if (!sampleContext) {
+    return null;
+  }
+
+  sampleContext.fillStyle = "#fff";
+  sampleContext.fillRect(0, 0, sampleSize, sampleSize);
+  sampleContext.drawImage(canvas, bbox.x, bbox.y, bbox.width, bbox.height, 0, 0, sampleSize, sampleSize);
+  const data = sampleContext.getImageData(0, 0, sampleSize, sampleSize).data;
+  const columns = new Array<number>(sampleSize).fill(0);
+  const rows = new Array<number>(sampleSize).fill(0);
+
+  for (let y = 0; y < sampleSize; y += 1) {
+    for (let x = 0; x < sampleSize; x += 1) {
+      const offset = (y * sampleSize + x) * 4;
+      const luminance = (data[offset] + data[offset + 1] + data[offset + 2]) / 765;
+      if (luminance < 0.42) {
+        columns[x] += 1;
+        rows[y] += 1;
+      }
+    }
+  }
+
+  const xLines = linePeaks(columns.map((value) => value / sampleSize));
+  const yLines = linePeaks(rows.map((value) => value / sampleSize));
+  let best: { x1: number; x2: number; y1: number; y2: number; score: number } | null = null;
+
+  for (const x1 of xLines) {
+    for (const x2 of xLines) {
+      if (x2 <= x1) continue;
+      const width = x2 - x1;
+      if (width < sampleSize * 0.38 || width > sampleSize * 0.94) continue;
+      for (const y1 of yLines) {
+        for (const y2 of yLines) {
+          if (y2 <= y1) continue;
+          const height = y2 - y1;
+          const size = Math.max(width, height);
+          if (Math.abs(width - height) > size * 0.14) continue;
+          if (height < sampleSize * 0.38 || height > sampleSize * 0.94) continue;
+          const score = columns[x1] + columns[x2] + rows[y1] + rows[y2] - Math.abs(width - height) * 0.15;
+          if (!best || score > best.score) {
+            best = { x1, x2, y1, y2, score };
+          }
+        }
+      }
+    }
+  }
+
+  if (!best) {
+    return null;
+  }
+
+  const x = bbox.x + (best.x1 / sampleSize) * bbox.width;
+  const y = bbox.y + (best.y1 / sampleSize) * bbox.height;
+  const width = ((best.x2 - best.x1) / sampleSize) * bbox.width;
+  const height = ((best.y2 - best.y1) / sampleSize) * bbox.height;
+  const size = Math.max(width, height);
+
+  return clampSquareBox(
+    {
+      x: x - size * 0.01,
+      y: y - size * 0.01,
+      width: size * 1.02,
+      height: size * 1.02,
+    },
+    canvas.width,
+    canvas.height,
+  );
+}
+
+function linePeaks(values: number[]) {
+  const threshold = Math.max(0.08, percentile(values, 0.9) * 0.72);
+  const peaks: number[] = [];
+  let start = -1;
+  let mass = 0;
+
+  for (let index = 0; index <= values.length; index += 1) {
+    if (index < values.length && values[index] >= threshold) {
+      if (start === -1) {
+        start = index;
+        mass = 0;
+      }
+      mass += values[index];
+      continue;
+    }
+
+    if (start !== -1) {
+      const end = index - 1;
+      const center = Math.round((start + end) / 2);
+      if (mass / (end - start + 1) >= threshold) {
+        peaks.push(center);
+      }
+      start = -1;
+      mass = 0;
+    }
+  }
+
+  return peaks;
+}
+
+function tightenBoardByDensity(canvas: HTMLCanvasElement, bbox: BBox): BBox | null {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    return null;
+  }
+
+  const sampleSize = 180;
+  const sample = window.document.createElement("canvas");
+  sample.width = sampleSize;
+  sample.height = sampleSize;
+  const sampleContext = sample.getContext("2d", { willReadFrequently: true });
+  if (!sampleContext) {
+    return null;
+  }
+
+  sampleContext.fillStyle = "#fff";
+  sampleContext.fillRect(0, 0, sampleSize, sampleSize);
+  sampleContext.drawImage(canvas, bbox.x, bbox.y, bbox.width, bbox.height, 0, 0, sampleSize, sampleSize);
+  const data = sampleContext.getImageData(0, 0, sampleSize, sampleSize).data;
+  const columns = new Array<number>(sampleSize).fill(0);
+  const rows = new Array<number>(sampleSize).fill(0);
+
+  for (let y = 0; y < sampleSize; y += 1) {
+    for (let x = 0; x < sampleSize; x += 1) {
+      const offset = (y * sampleSize + x) * 4;
+      const luminance = (data[offset] + data[offset + 1] + data[offset + 2]) / 765;
+      const ink = Math.max(0, 1 - luminance);
+      if (ink > 0.055) {
+        columns[x] += ink;
+        rows[y] += ink;
+      }
+    }
+  }
+
+  const xSegment = denseSegment(columns.map((value) => value / sampleSize));
+  const ySegment = denseSegment(rows.map((value) => value / sampleSize));
+  if (!xSegment || !ySegment) {
+    return null;
+  }
+
+  const x = bbox.x + (xSegment.start / sampleSize) * bbox.width;
+  const y = bbox.y + (ySegment.start / sampleSize) * bbox.height;
+  const width = ((xSegment.end - xSegment.start + 1) / sampleSize) * bbox.width;
+  const height = ((ySegment.end - ySegment.start + 1) / sampleSize) * bbox.height;
+  const size = Math.min(width, height);
+
+  if (size < bbox.width * 0.42 || size > bbox.width * 1.02) {
+    return null;
+  }
+
+  return clampSquareBox(
+    {
+      x: x + Math.max(0, (width - size) / 2),
+      y: y + Math.max(0, (height - size) / 2),
+      width: size,
+      height: size,
+    },
+    canvas.width,
+    canvas.height,
+  );
+}
+
+function denseSegment(values: number[]) {
+  const smoothed = values.map((_, index) => {
+    const start = Math.max(0, index - 3);
+    const end = Math.min(values.length - 1, index + 3);
+    return average(values.slice(start, end + 1));
+  });
+  const threshold = Math.max(0.018, percentile(smoothed, 0.58));
+  let best: { start: number; end: number; mass: number } | null = null;
+  let start = -1;
+  let mass = 0;
+
+  for (let index = 0; index <= smoothed.length; index += 1) {
+    if (index < smoothed.length && smoothed[index] >= threshold) {
+      if (start === -1) {
+        start = index;
+        mass = 0;
+      }
+      mass += smoothed[index];
+      continue;
+    }
+
+    if (start !== -1) {
+      const segment = { start, end: index - 1, mass };
+      const length = segment.end - segment.start + 1;
+      if (length >= values.length * 0.34 && (!best || segment.mass > best.mass)) {
+        best = segment;
+      }
+      start = -1;
+      mass = 0;
+    }
+  }
+
+  return best;
+}
+
+function dedupeBoxes(boxes: BBox[]) {
+  const seen = new Set<string>();
+  const unique: BBox[] = [];
+  for (const box of boxes) {
+    const key = `${Math.round(box.x)}:${Math.round(box.y)}:${Math.round(box.width)}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(box);
+    }
+  }
+  return unique;
+}
+
+function scoreFenStructure(fen: string) {
+  const rows = fen.split(" ")[0]?.split("/") ?? [];
+  if (rows.length !== 8) {
+    return 0;
+  }
+
+  let whiteKings = 0;
+  let blackKings = 0;
+  let whitePawns = 0;
+  let blackPawns = 0;
+  const pieceCounts = new Map<string, number>();
+  let pieces = 0;
+  let pawnsOnBackRank = 0;
+
+  rows.forEach((row, rowIndex) => {
+    for (const char of row) {
+      if (/\d/.test(char)) {
+        continue;
+      }
+      pieces += 1;
+      pieceCounts.set(char, (pieceCounts.get(char) ?? 0) + 1);
+      if (char === "K") whiteKings += 1;
+      if (char === "k") blackKings += 1;
+      if (char === "P") {
+        whitePawns += 1;
+        if (rowIndex === 0 || rowIndex === 7) pawnsOnBackRank += 1;
+      }
+      if (char === "p") {
+        blackPawns += 1;
+        if (rowIndex === 0 || rowIndex === 7) pawnsOnBackRank += 1;
+      }
+    }
+  });
+
+  let score = 0;
+  if (whiteKings === 1) score += 0.32;
+  if (blackKings === 1) score += 0.32;
+  if (pieces >= 2 && pieces <= 32) score += 0.14;
+  if (whitePawns <= 8 && blackPawns <= 8) score += 0.1;
+  if (pawnsOnBackRank === 0) score += 0.12;
+  if (
+    (pieceCounts.get("Q") ?? 0) > 1 ||
+    (pieceCounts.get("q") ?? 0) > 1 ||
+    (pieceCounts.get("R") ?? 0) > 2 ||
+    (pieceCounts.get("r") ?? 0) > 2 ||
+    (pieceCounts.get("B") ?? 0) > 2 ||
+    (pieceCounts.get("b") ?? 0) > 2 ||
+    (pieceCounts.get("N") ?? 0) > 2 ||
+    (pieceCounts.get("n") ?? 0) > 2
+  ) {
+    score -= 0.3;
+  }
+  return score;
+}
+
+function combineDiagramConfidence(candidateConfidence: number, classification: BoardClassification) {
+  if (classification.source === "fenify") {
+    return Math.max(
+      0.56,
+      Math.min(0.95, classification.confidence * 0.82 + candidateConfidence * 0.18),
+    );
+  }
+
+  if (classification.source === "template") {
+    return Math.max(candidateConfidence, Math.min(0.82, classification.confidence));
+  }
+
+  return Math.min(candidateConfidence, classification.confidence);
 }
 
 /**
@@ -394,7 +797,7 @@ function cropToDataUrl(source: HTMLCanvasElement, bbox: BBox): string {
   return canvas.toDataURL("image/jpeg", 0.82);
 }
 
-function classifyBoardWithTemplates(source: HTMLCanvasElement, bbox: BBox): { fen: string; confidence: number; notes: string[] } | null {
+function classifyBoardWithTemplates(source: HTMLCanvasElement, bbox: BBox): BoardClassification | null {
   const templates = getPieceTemplates();
   const board: string[][] = Array.from({ length: 8 }, () => Array.from({ length: 8 }, () => ""));
   const classified: Array<{ rank: number; file: number; fen: string; score: number }> = [];
@@ -464,6 +867,7 @@ function classifyBoardWithTemplates(source: HTMLCanvasElement, bbox: BBox): { fe
   return {
     fen: `${board.map(collapseFenRow).join("/")} w - - 0 1`,
     confidence,
+    source: "template",
     notes: [
       "Pieces were recognized with the local image classifier.",
       "Scanned book diagrams can still need correction when the print is faint or skewed.",
@@ -586,6 +990,39 @@ function clampSquareBox(bbox: BBox, width: number, height: number): BBox {
   const x = Math.max(0, Math.min(width - size, bbox.x));
   const y = Math.max(0, Math.min(height - size, bbox.y));
   return { x, y, width: size, height: size };
+}
+
+function refineBoardCandidate(
+  context: CanvasRenderingContext2D,
+  candidate: BBox & { confidence: number },
+): BBox & { confidence: number } {
+  let best = candidate;
+  const originalSize = candidate.width;
+  const scaleFactors = [0.9, 0.96, 1, 1.04, 1.1];
+
+  for (const scale of scaleFactors) {
+    const size = Math.floor(originalSize * scale);
+    if (size < 64 || size > Math.min(context.canvas.width, context.canvas.height)) {
+      continue;
+    }
+
+    const step = Math.max(3, Math.floor(size / 32));
+    const centerX = candidate.x + candidate.width / 2;
+    const centerY = candidate.y + candidate.height / 2;
+
+    for (let dy = -step * 3; dy <= step * 3; dy += step) {
+      for (let dx = -step * 3; dx <= step * 3; dx += step) {
+        const x = Math.max(0, Math.min(context.canvas.width - size, Math.floor(centerX - size / 2 + dx)));
+        const y = Math.max(0, Math.min(context.canvas.height - size, Math.floor(centerY - size / 2 + dy)));
+        const confidence = scoreBoardCandidate(context, x, y, size);
+        if (confidence > best.confidence) {
+          best = { x, y, width: size, height: size, confidence };
+        }
+      }
+    }
+  }
+
+  return best;
 }
 
 function scoreBoardCandidate(context: CanvasRenderingContext2D, x: number, y: number, size: number): number {

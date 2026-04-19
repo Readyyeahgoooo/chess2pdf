@@ -20,6 +20,7 @@ const eslintConfig = defineConfig([
     "test-results/**",
     "playwright-report/**",
     "public/fenify/**",
+    "public/ort/**",
     "public/pdfjs/**",
     "public/stockfish/**",
     "public/tesseract/**",

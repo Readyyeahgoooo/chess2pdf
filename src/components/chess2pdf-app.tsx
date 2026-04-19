@@ -371,6 +371,14 @@ export function Chess2PdfApp() {
     const line = sourceLines.find((item) => item.diagramId === diagram.id);
     setSelectedLineId(line?.id ?? null);
     setOcrTextDraft(line?.rawText || "");
+    if (!isValidFen(diagram.fen)) {
+      setEngineEval(undefined);
+      setBookEval(undefined);
+      setEvalDeltaCp(undefined);
+      setEngineStatus("Engine idle");
+      setProgress("Recognition found a board crop, but the FEN was not legal. Crop only the 8x8 board or choose another detected board.");
+      return;
+    }
     if (!shouldApplyBoard) {
       const moveCount = line?.sanMoves.length ?? 0;
       setEngineEval(undefined);

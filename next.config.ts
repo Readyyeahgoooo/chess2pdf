@@ -17,9 +17,16 @@ const nextConfig: NextConfig = {
   allowedDevOrigins: ["127.0.0.1", "localhost"],
   async headers() {
     const fenifyModelOrigin = originFromUrl(process.env.NEXT_PUBLIC_FENIFY_MODEL_URL);
+    // Hugging Face redirects downloads through its CDN (*.hf.co, *.xethub.hf.co).
+    // We need to allow all *.hf.co subdomains when the model is hosted on HF.
+    const hfCdnExtra = fenifyModelOrigin?.includes("huggingface.co")
+      ? " https://*.hf.co https://huggingface.co"
+      : fenifyModelOrigin
+        ? ` ${fenifyModelOrigin}`
+        : "";
     const connectSrc = isDev
-      ? `connect-src 'self' blob: data: ws: http://localhost:3000 http://127.0.0.1:3000${fenifyModelOrigin ? ` ${fenifyModelOrigin}` : ""}`
-      : `connect-src 'self' blob: data:${fenifyModelOrigin ? ` ${fenifyModelOrigin}` : ""}`;
+      ? `connect-src 'self' blob: data: ws: http://localhost:3000 http://127.0.0.1:3000${hfCdnExtra}`
+      : `connect-src 'self' blob: data:${hfCdnExtra}`;
 
     const csp = [
       "default-src 'self'",

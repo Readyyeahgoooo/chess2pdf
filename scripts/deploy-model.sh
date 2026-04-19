@@ -22,7 +22,7 @@ OPENROUTER_KEY=""        # optional
 
 set -euo pipefail
 
-HF_USER="Readyyeahgoooo"
+HF_USER="Westcoastrenmen"
 HF_REPO="chess2pdf-fenify"
 MODEL_FILE="$(dirname "$0")/../public/fenify/model.onnx"
 MODEL_URL="https://huggingface.co/${HF_USER}/${HF_REPO}/resolve/main/model.onnx"

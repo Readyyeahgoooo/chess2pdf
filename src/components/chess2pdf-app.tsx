@@ -376,7 +376,7 @@ export function Chess2PdfApp() {
       setBookEval(undefined);
       setEvalDeltaCp(undefined);
       setEngineStatus("Engine idle");
-      setProgress("Recognition found a board crop, but the FEN was not legal. Crop only the 8x8 board or choose another detected board.");
+      setProgress("Recognition found a board crop, but the position was not legal. Crop only the 8x8 board or choose another detected board.");
       return;
     }
     if (!shouldApplyBoard) {
@@ -388,7 +388,7 @@ export function Chess2PdfApp() {
       setProgress(
         moveCount > 0
           ? `Low-confidence board selected. ${moveCount} move${moveCount === 1 ? "" : "s"} detected, but the position was not auto-applied.`
-          : "Low-confidence board selected. Use Crop board, Edit mode, or FEN correction before analysis.",
+          : "Low-confidence board selected. Use Crop board or Edit mode before analysis.",
       );
       return;
     }
@@ -398,7 +398,7 @@ export function Chess2PdfApp() {
       setProgress(
         moveCount > 0
           ? `Board loaded (low confidence). ${moveCount} move${moveCount === 1 ? "" : "s"} detected — step through with the move buttons or chips.`
-          : "Board loaded. Confidence is low — paste the correct FEN in the position section if the pieces look wrong.",
+          : "Board loaded. Confidence is low — use Edit mode if the pieces look wrong.",
       );
     }
     await analyzePosition(diagram.fen);
@@ -406,12 +406,12 @@ export function Chess2PdfApp() {
 
   function applyFenDraft() {
     if (!isValidFen(fenDraft)) {
-      setError("That FEN is invalid. Keep both kings on the board before analysis.");
+      setError("That position is invalid. Keep both kings on the board before analysis.");
       return;
     }
     setError("");
     resetBoard(fenDraft);
-    setProgress("FEN applied.");
+    setProgress("Position applied.");
     void analyzePosition(fenDraft);
   }
 
@@ -569,7 +569,7 @@ export function Chess2PdfApp() {
 
   async function analyzePosition(targetFen = fen, compareFen?: string) {
     if (!isValidFen(targetFen)) {
-      setError("Stockfish needs a valid FEN with both kings.");
+      setError("Stockfish needs a valid position with both kings.");
       return;
     }
     setEngineStatus(`Analyzing to depth ${DEFAULT_DEPTH} locally...`);
@@ -631,7 +631,7 @@ export function Chess2PdfApp() {
 
   async function copyFen() {
     await navigator.clipboard.writeText(fen);
-    setProgress("FEN copied.");
+    setProgress("Position notation copied.");
   }
 
   async function copyPgn() {
@@ -725,7 +725,7 @@ export function Chess2PdfApp() {
       setProgress(
         result.line.sanMoves.length
           ? `Manual crop added with ${result.line.sanMoves.length} parsed move${result.line.sanMoves.length === 1 ? "" : "s"}.`
-          : "Manual crop added. Correct the OCR text or FEN if needed.",
+          : "Manual crop added. Correct the OCR text or position if needed.",
       );
 
       const session = buildSession(mergedDiagrams, mergedLines);
@@ -1083,14 +1083,14 @@ export function Chess2PdfApp() {
                   Analyze
                 </button>
               </div>
-              {/* Position / FEN — collapsed to reduce noise */}
+              {/* Advanced position notation — collapsed to reduce noise */}
               <details className="mt-3">
                 <summary className="cursor-pointer rounded px-1 py-1 text-xs font-semibold text-muted hover:text-foreground">
-                  Position / FEN (advanced)
+                  Position tools (advanced)
                 </summary>
                 <div className="mt-2">
                   <label className="mb-1 block text-sm font-semibold" htmlFor="fen-input">
-                    Current FEN
+                    Position notation
                   </label>
                   <textarea
                     id="fen-input"
@@ -1100,10 +1100,10 @@ export function Chess2PdfApp() {
                   />
                   <div className="mt-2 flex flex-wrap gap-2">
                     <button className="rounded-md bg-accent px-3 py-2 text-sm font-semibold text-white" onClick={applyFenDraft}>
-                      Apply FEN
+                      Apply position
                     </button>
                     <button className="rounded-md border border-line px-3 py-2 text-sm font-semibold" onClick={() => void copyFen()}>
-                      Copy FEN
+                      Copy notation
                     </button>
                     <a className="rounded-md border border-line px-3 py-2 text-sm font-semibold" href={lichessUrl} target="_blank" rel="noreferrer">
                       Open Lichess

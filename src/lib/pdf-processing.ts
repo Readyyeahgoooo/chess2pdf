@@ -188,7 +188,7 @@ export async function classifyBoardFen(
       notes: [
         "Piece types estimated from ink density — squares with pieces are shown but piece identity needs correction.",
         "Run  scripts/convert_fenify_to_onnx.py  to enable the Fenify ML classifier for accurate piece identification.",
-        "Use Edit mode or paste the FEN to fix piece identities in the meantime.",
+        "Use Edit mode or advanced position notation to fix piece identities in the meantime.",
       ],
     };
   }

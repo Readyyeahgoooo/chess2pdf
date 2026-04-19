@@ -15,6 +15,7 @@ import {
   type PdfDocument,
   type RenderedPage,
 } from "@/lib/pdf-processing";
+import { fenifyStatus, isFenifyReady } from "@/lib/fenify-inference";
 import { clearLocalData, listSessions, saveSession } from "@/lib/storage";
 import { StockfishClient } from "@/lib/stockfish";
 import type { ChessAiMode, ChessAiResponse } from "@/lib/ai-chess";
@@ -60,6 +61,7 @@ export function Chess2PdfApp() {
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
   const [sessions, setSessions] = useState<PdfSession[]>([]);
   const [fen, setFen] = useState(UNRECOGNIZED_FEN);
+  const [boardHasPosition, setBoardHasPosition] = useState(false);
   const [fenDraft, setFenDraft] = useState(UNRECOGNIZED_FEN);
   const [playedMoves, setPlayedMoves] = useState<string[]>([]);
   const [deviationPly, setDeviationPly] = useState<number | undefined>();
@@ -77,6 +79,7 @@ export function Chess2PdfApp() {
   const [cropMode, setCropMode] = useState(false);
   const [cropStart, setCropStart] = useState<CropPoint | null>(null);
   const [cropBox, setCropBox] = useState<BBox | null>(null);
+  const [modelStatus, setModelStatus] = useState<"idle" | "loading" | "ready" | "unavailable">("idle");
 
   const canvasesRef = useRef(new Map<number, HTMLCanvasElement>());
   const pagePreviewsRef = useRef(new Map<number, PdfPagePreview>());
@@ -85,8 +88,8 @@ export function Chess2PdfApp() {
   const stockfishRef = useRef<StockfishClient | null>(null);
   const scanRunRef = useRef(0);
 
-  const selectedDiagram = diagrams.find((diagram) => diagram.id === selectedDiagramId) ?? diagrams[0];
-  const selectedLines = selectedDiagram ? lines.filter((line) => line.diagramId === selectedDiagram.id) : lines;
+  const selectedDiagram = diagrams.find((diagram) => diagram.id === selectedDiagramId) ?? null;
+  const selectedLines = selectedDiagram ? lines.filter((line) => line.diagramId === selectedDiagram.id) : [];
   const expectedLine = selectedLines.find((line) => line.id === selectedLineId) ?? selectedLines.find((line) => line.sanMoves.length > 0) ?? selectedLines[0];
   const pagePreviewMap = useMemo(() => new Map(pages.map((page) => [page.pageIndex, page])), [pages]);
   const scannedPageSet = useMemo(() => new Set(scannedPages), [scannedPages]);
@@ -105,9 +108,10 @@ export function Chess2PdfApp() {
     }
   }, [fen]);
 
-  const resetBoard = useCallback((nextFen = UNRECOGNIZED_FEN) => {
+  const resetBoard = useCallback((nextFen = UNRECOGNIZED_FEN, options: { loaded?: boolean } = {}) => {
     const resolved = safeFen(nextFen);
     setFen(resolved);
+    setBoardHasPosition(options.loaded ?? resolved !== UNRECOGNIZED_FEN);
     setFenDraft(resolved);
     setPlayedMoves([]);
     setDeviationPly(undefined);
@@ -142,6 +146,20 @@ export function Chess2PdfApp() {
     };
   }, [refreshSessions]);
 
+  // Poll for Fenify model load status so the UI can reflect when recognition is ready.
+  useEffect(() => {
+    setModelStatus(fenifyStatus());
+    if (isFenifyReady()) return;
+    const timer = setInterval(() => {
+      const s = fenifyStatus();
+      setModelStatus(s);
+      if (s === "ready" || s === "unavailable") {
+        clearInterval(timer);
+      }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, []);
+
   async function handleFile(file: File) {
     setError("");
     setStatus("loading");
@@ -173,6 +191,7 @@ export function Chess2PdfApp() {
       setSelectedDiagramId(null);
       setSelectedLineId(null);
       setFen(UNRECOGNIZED_FEN);
+      setBoardHasPosition(false);
       setFenDraft(UNRECOGNIZED_FEN);
       setPlayedMoves([]);
       setDeviationPly(undefined);
@@ -256,10 +275,13 @@ export function Chess2PdfApp() {
 
     const scannedCount = indices.length;
     const foundDiagramCount = newDiagrams.length;
+    const foundRecognizedBoardCount = newDiagrams.filter((diagram) => canPopulateBoard(diagram)).length;
     const foundLineCount = newLines.filter((line) => line.sanMoves.length > 0).length;
     setProgress(
-      foundDiagramCount > 0
-        ? `Scan complete: ${foundDiagramCount} board${foundDiagramCount === 1 ? "" : "s"} and ${foundLineCount} parsed line${foundLineCount === 1 ? "" : "s"} across ${scannedCount} page${scannedCount === 1 ? "" : "s"}.`
+      foundRecognizedBoardCount > 0
+        ? `Scan complete: ${foundRecognizedBoardCount} reliable board${foundRecognizedBoardCount === 1 ? "" : "s"}, ${foundDiagramCount} board-like crop${foundDiagramCount === 1 ? "" : "s"}, and ${foundLineCount} parsed line${foundLineCount === 1 ? "" : "s"} across ${scannedCount} page${scannedCount === 1 ? "" : "s"}.`
+        : foundDiagramCount > 0
+        ? `Scan complete: ${foundDiagramCount} board-like crop${foundDiagramCount === 1 ? "" : "s"} found, but none were reliable enough to load automatically. Try Crop board on the exact 8x8 diagram.`
         : "No board-like diagram found in that scan range.",
     );
     setStatus("ready");
@@ -297,6 +319,8 @@ export function Chess2PdfApp() {
       const pageFirstDiagram = bestDiagramForPage(boundedPageIndex, diagrams);
       if (pageFirstDiagram) {
         await selectDiagram(pageFirstDiagram, lines, { auto: true, navigate: false });
+      } else {
+        clearBoardSelection(`Page ${boundedPageIndex + 1} has been scanned, but no board was recognised on this page.`);
       }
     }
     // Don't auto-scan — user clicks "Scan page" / "Scan range" explicitly.
@@ -357,13 +381,32 @@ export function Chess2PdfApp() {
       .sort((a, b) => b.confidence - a.confidence)[0];
   }
 
+  function canPopulateBoard(diagram: DetectedDiagram | null | undefined) {
+    if (!diagram || !isValidFen(diagram.fen)) {
+      return false;
+    }
+    // Only auto-populate from the neural-network recogniser.
+    // Template / occupancy / fallback heuristics produce too many false
+    // positives on scanned books to be auto-applied to the board.
+    return diagram.recognitionSource === "fenify";
+  }
+
+  function clearBoardSelection(message: string) {
+    setSelectedDiagramId(null);
+    setSelectedLineId(null);
+    setOcrTextDraft("");
+    resetBoard(UNRECOGNIZED_FEN, { loaded: false });
+    setProgress(message);
+  }
+
   async function selectDiagram(
     diagram: DetectedDiagram,
     sourceLines = lines,
     options: { auto?: boolean; navigate?: boolean } = {},
   ) {
     const shouldNavigatePage = options.navigate ?? true;
-    const shouldApplyBoard = !options.auto || diagram.confidence >= AUTO_APPLY_CONFIDENCE;
+    const canApplyBoard = canPopulateBoard(diagram);
+    const shouldApplyBoard = canApplyBoard && (!options.auto || diagram.confidence >= AUTO_APPLY_CONFIDENCE);
     setSelectedDiagramId(diagram.id);
     if (shouldNavigatePage && diagram.pageIndex !== currentPage) {
       setCurrentPage(diagram.pageIndex);
@@ -379,8 +422,20 @@ export function Chess2PdfApp() {
       setProgress("Recognition found a board crop, but the position was not legal. Crop only the 8x8 board or choose another detected board.");
       return;
     }
+    if (!canApplyBoard) {
+      resetBoard(UNRECOGNIZED_FEN, { loaded: false });
+      setEngineEval(undefined);
+      setBookEval(undefined);
+      setEvalDeltaCp(undefined);
+      setEngineStatus("Engine idle");
+      setProgress(
+        "A board-like crop was found, but piece recognition was not reliable enough to load it. Try Crop board on the exact 8x8 diagram or scan another page.",
+      );
+      return;
+    }
     if (!shouldApplyBoard) {
       const moveCount = line?.sanMoves.length ?? 0;
+      resetBoard(UNRECOGNIZED_FEN, { loaded: false });
       setEngineEval(undefined);
       setBookEval(undefined);
       setEvalDeltaCp(undefined);
@@ -392,7 +447,7 @@ export function Chess2PdfApp() {
       );
       return;
     }
-    resetBoard(diagram.fen);
+    resetBoard(diagram.fen, { loaded: true });
     if (diagram.confidence < AUTO_APPLY_CONFIDENCE) {
       const moveCount = line?.sanMoves.length ?? 0;
       setProgress(
@@ -410,7 +465,7 @@ export function Chess2PdfApp() {
       return;
     }
     setError("");
-    resetBoard(fenDraft);
+    resetBoard(fenDraft, { loaded: true });
     setProgress("Position applied.");
     void analyzePosition(fenDraft);
   }
@@ -448,6 +503,7 @@ export function Chess2PdfApp() {
     if (editMode) {
       const nextFen = movePieceInFen(fen, sourceSquare, targetSquare);
       setFen(nextFen);
+      setBoardHasPosition(true);
       setFenDraft(nextFen);
       setPlayedMoves([]);
       setDeviationPly(undefined);
@@ -480,6 +536,7 @@ export function Chess2PdfApp() {
         }
       }
       setFen(game.fen());
+      setBoardHasPosition(true);
       setFenDraft(game.fen());
       setPlayedMoves(nextMoves);
       if (deviated && deviationPly === undefined) {
@@ -498,6 +555,7 @@ export function Chess2PdfApp() {
     }
     const nextFen = placePieceInFen(fen, square, selectedPiece);
     setFen(nextFen);
+    setBoardHasPosition(true);
     setFenDraft(nextFen);
     setPlayedMoves([]);
     setDeviationPly(undefined);
@@ -522,6 +580,7 @@ export function Chess2PdfApp() {
       return;
     }
     setFen(currentChess.fen());
+    setBoardHasPosition(true);
     setFenDraft(currentChess.fen());
     const nextMoves = [...playedMoves, move.san];
     setPlayedMoves(nextMoves);
@@ -536,6 +595,7 @@ export function Chess2PdfApp() {
       game.move(san, { strict: false });
     }
     setFen(game.fen());
+    setBoardHasPosition(true);
     setFenDraft(game.fen());
     setPlayedMoves(nextMoves);
     if (deviationPly !== undefined && nextMoves.length < deviationPly) {
@@ -561,6 +621,7 @@ export function Chess2PdfApp() {
       nextMoves.push(moved.san);
     }
     setFen(game.fen());
+    setBoardHasPosition(true);
     setFenDraft(game.fen());
     setPlayedMoves(nextMoves);
     setDeviationPly(undefined);
@@ -671,9 +732,14 @@ export function Chess2PdfApp() {
     const diagram = diagrams.find((item) => item.id === line.diagramId);
     if (diagram) {
       setSelectedDiagramId(diagram.id);
-      const sourceFen = safeFen(diagram.fen);
-      resetBoard(sourceFen);
-      void analyzePosition(sourceFen);
+      if (canPopulateBoard(diagram)) {
+        const sourceFen = safeFen(diagram.fen);
+        resetBoard(sourceFen, { loaded: true });
+        void analyzePosition(sourceFen);
+      } else {
+        resetBoard(UNRECOGNIZED_FEN, { loaded: false });
+        setProgress("That line belongs to a crop whose pieces were not recognised reliably enough to load.");
+      }
     }
   }
 
@@ -904,6 +970,28 @@ export function Chess2PdfApp() {
                 Next 20
               </button>
               <p className="col-span-4 text-xs text-muted">Estimate: about 8 seconds per page on typical scans.</p>
+              {/* Model status strip */}
+              <div className={`col-span-4 flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold ${
+                modelStatus === "ready"
+                  ? "bg-[#e8f5f1] text-accent"
+                  : modelStatus === "unavailable"
+                    ? "bg-[#fff3e0] text-warn"
+                    : "bg-background text-muted"
+              }`}>
+                {modelStatus === "loading" ? (
+                  <svg className="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                ) : null}
+                {modelStatus === "ready"
+                  ? "AI board recognition ready — scan for accurate results."
+                  : modelStatus === "loading"
+                    ? "AI model loading (first time, ~30 s) — scan will use it once ready."
+                    : modelStatus === "unavailable"
+                      ? "AI model unavailable — results will be heuristic only."
+                      : "AI model not yet started."}
+              </div>
             </div>
             <div className="max-h-[58vh] overflow-auto px-4 pb-4">
               {totalPages === 0 ? (
@@ -953,11 +1041,14 @@ export function Chess2PdfApp() {
                     {editMode ? "Play mode" : "Edit mode"}
                   </button>
                   <button
-                    className="rounded-md border border-line px-3 py-2 font-semibold"
+                    className="rounded-md border border-line px-3 py-2 font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={!boardHasPosition && !canPopulateBoard(selectedDiagram)}
                     onClick={() => {
-                      const sourceFen = safeFen(selectedDiagram?.fen ?? STARTING_FEN);
-                      resetBoard(sourceFen);
-                      void analyzePosition(sourceFen);
+                      const sourceFen = selectedDiagram && canPopulateBoard(selectedDiagram) ? safeFen(selectedDiagram.fen) : fen;
+                      resetBoard(sourceFen, { loaded: sourceFen !== UNRECOGNIZED_FEN });
+                      if (sourceFen !== UNRECOGNIZED_FEN) {
+                        void analyzePosition(sourceFen);
+                      }
                     }}
                   >
                     Reset
@@ -983,22 +1074,44 @@ export function Chess2PdfApp() {
                   Page {currentPage + 1} board {selectedPageDiagramNumber || 1} of {visiblePageDiagrams.length}
                 </p>
               ) : null}
+              {selectedDiagram && selectedDiagram.pageIndex !== currentPage ? (
+                <p className="mb-3 rounded-md bg-[#fff8e6] p-3 text-sm text-warn">
+                  Loaded crop is from page {selectedDiagram.pageIndex + 1}. The PDF viewer is currently on page {currentPage + 1}.
+                </p>
+              ) : null}
+              {selectedDiagram && boardHasPosition ? (
+                <p className="mb-3 rounded-md bg-background p-3 text-sm text-muted">
+                  Board source: page {selectedDiagram.pageIndex + 1}, confidence {Math.round(selectedDiagram.confidence * 100)} percent,{" "}
+                  {selectedDiagram.recognitionSource === "fenify" ? "Fenify recognition" : "high-confidence template recognition"}.
+                </p>
+              ) : null}
 
               <div className="mx-auto max-w-[620px]">
-                <Chessboard
-                  options={{
-                    id: "chess2pdf-board",
-                    position: fen,
-                    boardOrientation: orientation,
-                    showNotation: true,
-                    animationDurationInMs: 120,
-                    darkSquareStyle: { backgroundColor: "#6f8f7f" },
-                    lightSquareStyle: { backgroundColor: "#edf3ee" },
-                    boardStyle: { borderRadius: 6, boxShadow: "0 10px 30px rgba(24, 33, 29, 0.16)" },
-                    onPieceDrop: handlePieceDrop,
-                    onSquareClick: handleSquareClick,
-                  }}
-                />
+                {boardHasPosition || editMode ? (
+                  <Chessboard
+                    options={{
+                      id: "chess2pdf-board",
+                      position: fen,
+                      boardOrientation: orientation,
+                      showNotation: true,
+                      animationDurationInMs: 120,
+                      darkSquareStyle: { backgroundColor: "#6f8f7f" },
+                      lightSquareStyle: { backgroundColor: "#edf3ee" },
+                      boardStyle: { borderRadius: 6, boxShadow: "0 10px 30px rgba(24, 33, 29, 0.16)" },
+                      onPieceDrop: handlePieceDrop,
+                      onSquareClick: handleSquareClick,
+                    }}
+                  />
+                ) : (
+                  <div className="grid aspect-square place-items-center rounded-md border border-dashed border-line bg-background p-8 text-center">
+                    <div>
+                      <p className="text-lg font-semibold">No reliable board loaded yet.</p>
+                      <p className="mt-2 text-sm text-muted">
+                        Scan a page with a clear chess diagram. If a crop is found but not loaded, use Crop board around the exact 8x8 board.
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {editMode ? (
@@ -1023,6 +1136,7 @@ export function Chess2PdfApp() {
                       onClick={() => {
                         const next = clearFen();
                         setFen(next);
+                        setBoardHasPosition(true);
                         setFenDraft(next);
                         setPlayedMoves([]);
                         setDeviationPly(undefined);
@@ -1064,7 +1178,7 @@ export function Chess2PdfApp() {
                 </button>
                 <button
                   className="rounded-md bg-accent px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  disabled={!expectedLine?.sanMoves.length || playedMoves.length >= (expectedLine?.sanMoves.length ?? 0)}
+                  disabled={!boardHasPosition || !expectedLine?.sanMoves.length || playedMoves.length >= (expectedLine?.sanMoves.length ?? 0)}
                   onClick={playExpectedMove}
                 >
                   Next →
@@ -1077,7 +1191,8 @@ export function Chess2PdfApp() {
                   Reset line
                 </button>
                 <button
-                  className="rounded-md border border-line px-3 py-2 text-sm font-semibold"
+                  className="rounded-md border border-line px-3 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!boardHasPosition}
                   onClick={() => void analyzePosition()}
                 >
                   Analyze
@@ -1205,6 +1320,13 @@ export function Chess2PdfApp() {
                       <div>
                         <p className="font-semibold">Board {index + 1}</p>
                         <p className="text-sm text-muted">Page {diagram.pageIndex + 1}, confidence {Math.round(diagram.confidence * 100)} percent</p>
+                        <p className={`text-xs font-semibold ${canPopulateBoard(diagram) ? "text-accent" : "text-warn"}`}>
+                          {canPopulateBoard(diagram)
+                            ? diagram.recognitionSource === "fenify"
+                              ? "Ready to load"
+                              : "Template match, please verify"
+                            : "Crop found, pieces not reliable"}
+                        </p>
                         {diagram.notes.map((note) => (
                           <p key={note} className="mt-1 text-xs text-warn">
                             {note}

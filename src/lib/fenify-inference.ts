@@ -71,6 +71,14 @@ export function isFenifyReady(): boolean {
   return _session !== null;
 }
 
+/** Returns a human-readable status for UI display. */
+export function fenifyStatus(): "idle" | "loading" | "ready" | "unavailable" {
+  if (_session !== null) return "ready";
+  if (_modelUnavailable) return "unavailable";
+  if (_loadPromise !== null) return "loading";
+  return "idle";
+}
+
 /**
  * Lazy-load the Fenify ONNX model.  Safe to call multiple times — subsequent
  * calls return the cached promise.  Returns null if the model file is absent

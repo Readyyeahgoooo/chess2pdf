@@ -242,10 +242,14 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
 
   for (const candidate of candidates.slice(0, 6)) {
     const classification = await classifyBoardFen(page.canvas, candidate);
-    // Only skip if classification itself is at minimum confidence AND the visual
-    // candidate score was also very weak — avoids flooding with false positives
-    // from dense text columns while still passing real scanned diagrams through.
-    const likelyFalsePositive = classification.confidence <= 0.28 && candidate.confidence < 0.46;
+    // Suppress false positives aggressively when running on heuristic sources
+    // (no Fenify model available). Heuristics misfire on tables, figures and
+    // dense text columns in scanned chess books.
+    const isHeuristic = classification.source !== "fenify";
+    const likelyFalsePositive =
+      isHeuristic
+        ? classification.confidence < 0.42 || candidate.confidence < 0.52
+        : classification.confidence <= 0.28 && candidate.confidence < 0.46;
     if (likelyFalsePositive) {
       continue;
     }
@@ -255,6 +259,7 @@ export async function scanRenderedPage(page: RenderedPage): Promise<PageScanResu
       bbox: classification.bbox ?? candidate,
       fen: classification.fen,
       confidence: combineDiagramConfidence(candidate.confidence, classification),
+      recognitionSource: classification.source,
       orientation: "white",
       sourceCropUrl: cropToDataUrl(page.canvas, classification.bbox ?? candidate),
       notes: classification.notes,
@@ -298,6 +303,7 @@ export async function scanManualBoard(page: RenderedPage, bbox: BBox): Promise<B
     bbox: normalized,
     fen: classification.fen,
     confidence: Math.max(0.42, classification.confidence),
+    recognitionSource: classification.source,
     orientation: "white",
     sourceCropUrl: cropToDataUrl(page.canvas, normalized),
     notes: ["Manual crop. Check piece identities before deep analysis."],

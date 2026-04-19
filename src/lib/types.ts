@@ -23,6 +23,7 @@ export type DetectedDiagram = {
   bbox: BBox;
   fen: string;
   confidence: number;
+  recognitionSource?: "fenify" | "template" | "occupancy" | "fallback";
   orientation: "white" | "black";
   sourceCropUrl?: string;
   notes: string[];

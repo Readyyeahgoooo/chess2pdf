@@ -112,7 +112,7 @@ tests/
 Push this repo to GitHub, then import it in [Vercel](https://vercel.com/new). For accurate production board recognition, host `public/fenify/model.onnx` on a public model/CDN URL and set:
 
 ```bash
-NEXT_PUBLIC_FENIFY_MODEL_URL=https://your-model-host/model.onnx
+NEXT_PUBLIC_FENIFY_MODEL_URL=https://huggingface.co/Westcoastrenmen/chess2pdf-fenify/resolve/main/model.onnx
 ```
 
 Add `OPENROUTER_API_KEY` only if you want the optional AI coach.

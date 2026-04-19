@@ -32,6 +32,8 @@ import type { BBox } from "@/lib/types";
 // ── constants ────────────────────────────────────────────────────────────────
 
 const MODEL_SIZE = 300; // pixels — Fenify input square size
+const DEFAULT_REMOTE_MODEL_URL =
+  "https://huggingface.co/Westcoastrenmen/chess2pdf-fenify/resolve/main/model.onnx";
 // ImageNet normalisation constants (channels R/G/B — all set to the grayscale value)
 const IMAGENET_MEAN = [0.485, 0.456, 0.406] as const;
 const IMAGENET_STD = [0.229, 0.224, 0.225] as const;
@@ -92,7 +94,8 @@ export async function loadFenifyModel(): Promise<OrtSession | null> {
       ort.env.wasm.wasmPaths = wasmBase;
 
       const modelUrl =
-        process.env.NEXT_PUBLIC_FENIFY_MODEL_URL ?? "/fenify/model.onnx";
+        process.env.NEXT_PUBLIC_FENIFY_MODEL_URL ??
+        (process.env.NODE_ENV === "production" ? DEFAULT_REMOTE_MODEL_URL : "/fenify/model.onnx");
 
       // Probe for the model file before trying to create a session (avoids a
       // confusing WASM crash when the file doesn't exist in dev)
